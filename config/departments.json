@@ -1,0 +1,14 @@
+{
+  "departments": [
+    {"name": "技术研发部", "builtin": true},
+    {"name": "AI 创新中心", "builtin": true},
+    {"name": "数据与算法部", "builtin": true},
+    {"name": "云架构事业部", "builtin": true},
+    {"name": "金融 BU", "builtin": true},
+    {"name": "互联网 BU", "builtin": true},
+    {"name": "政企 BU", "builtin": true},
+    {"name": "海外交付中心", "builtin": true},
+    {"name": "人力资源部", "builtin": true},
+    {"name": "未分配", "builtin": true}
+  ]
+}

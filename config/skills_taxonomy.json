@@ -1,0 +1,58 @@
+{
+  "categories": {
+    "编程语言": [
+      "Python", "Java", "C++", "C#", "JavaScript", "TypeScript", "Go", "Rust",
+      "Kotlin", "Swift", "PHP", "Ruby", "Scala", "R", "MATLAB"
+    ],
+    "前端": [
+      "React", "Vue", "Angular", "Next.js", "Nuxt.js", "Svelte",
+      "HTML5", "CSS3", "Tailwind CSS", "Webpack", "Vite"
+    ],
+    "后端": [
+      "Spring Boot", "Spring Cloud", "Django", "Flask", "FastAPI",
+      "Express", "NestJS", ".NET Core", "Gin", "Node.js"
+    ],
+    "数据库": [
+      "MySQL", "PostgreSQL", "MongoDB", "Redis", "Oracle", "SQL Server",
+      "Elasticsearch", "ClickHouse", "Cassandra", "DynamoDB"
+    ],
+    "云与容器": [
+      "Azure", "AWS", "GCP", "阿里云", "腾讯云",
+      "Docker", "Kubernetes", "Terraform", "Bicep", "Ansible", "Helm"
+    ],
+    "大数据": [
+      "Hadoop", "Spark", "Flink", "Kafka", "Hive", "Airflow", "Databricks"
+    ],
+    "AI/ML": [
+      "PyTorch", "TensorFlow", "LangChain", "LlamaIndex", "HuggingFace",
+      "OpenAI", "Azure OpenAI", "RAG", "LLM Fine-tuning", "Computer Vision",
+      "NLP", "Prompt Engineering", "Agent 开发"
+    ],
+    "DevOps": [
+      "Jenkins", "GitLab CI", "GitHub Actions", "Azure DevOps",
+      "Prometheus", "Grafana", "ELK", "Datadog"
+    ],
+    "测试": [
+      "JUnit", "Pytest", "Selenium", "Cypress", "Postman", "JMeter"
+    ],
+    "项目管理": [
+      "Agile", "Scrum", "Jira", "Confluence", "PMP"
+    ],
+    "软技能": [
+      "团队协作", "沟通能力", "问题解决", "领导力",
+      "客户沟通", "技术写作", "需求分析", "跨团队协作"
+    ]
+  },
+  "synonyms": {
+    "k8s": "Kubernetes",
+    "tf": "Terraform",
+    "py": "Python",
+    "js": "JavaScript",
+    "ts": "TypeScript",
+    "vue.js": "Vue",
+    "reactjs": "React",
+    "node": "Node.js",
+    "postgres": "PostgreSQL",
+    "mssql": "SQL Server"
+  }
+}

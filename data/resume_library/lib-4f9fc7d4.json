@@ -1,0 +1,40 @@
+{
+  "id": "lib-4f9fc7d4",
+  "display_name": "resume_09_钱测试九.pdf",
+  "department": "技术研发部",
+  "source_file": "resume_09_钱测试九.pdf",
+  "imported_at": "2026-05-20T17:06:50",
+  "parsed": {
+    "candidate_id": "R-6682",
+    "skills": [
+      "R",
+      "AWS",
+      "Jira",
+      "Confluence",
+      "PMP"
+    ],
+    "experience_years": 12,
+    "education": "硕士",
+    "highlights": [
+      "有完整项目交付经验",
+      "熟悉云原生与 DevOps 流程"
+    ],
+    "risks": []
+  },
+  "languages": [
+    {
+      "name": "英语",
+      "level": "母语"
+    },
+    {
+      "name": "法语",
+      "level": "母语"
+    },
+    {
+      "name": "西班牙语",
+      "level": "流利"
+    }
+  ],
+  "tags": [],
+  "notes": ""
+}

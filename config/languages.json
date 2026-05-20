@@ -1,0 +1,39 @@
+{
+  "languages": [
+    {"name": "英语", "code": "en", "builtin": true},
+    {"name": "法语", "code": "fr", "builtin": true},
+    {"name": "俄语", "code": "ru", "builtin": true},
+    {"name": "德语", "code": "de", "builtin": true},
+    {"name": "日语", "code": "ja", "builtin": true},
+    {"name": "韩语", "code": "ko", "builtin": true},
+    {"name": "西班牙语", "code": "es", "builtin": true},
+    {"name": "葡萄牙语", "code": "pt", "builtin": true},
+    {"name": "阿拉伯语", "code": "ar", "builtin": true},
+    {"name": "意大利语", "code": "it", "builtin": true}
+  ],
+  "levels": ["入门", "日常", "流利", "母语"],
+  "aliases": {
+    "english": "英语",
+    "french": "法语",
+    "russian": "俄语",
+    "german": "德语",
+    "japanese": "日语",
+    "korean": "韩语",
+    "spanish": "西班牙语",
+    "cet-4": "英语",
+    "cet-6": "英语",
+    "cet4": "英语",
+    "cet6": "英语",
+    "ielts": "英语",
+    "toefl": "英语",
+    "雅思": "英语",
+    "托福": "英语",
+    "四级": "英语",
+    "六级": "英语",
+    "jlpt": "日语",
+    "n1": "日语",
+    "n2": "日语",
+    "delf": "法语",
+    "dele": "西班牙语"
+  }
+}

@@ -1,0 +1,33 @@
+姓名：张三
+手机：13812345678
+邮箱：zhangsan@example.com
+身份证：110101199001011234
+地址：北京市海淀区中关村大街1号
+
+教育背景：
+2014.09 - 2018.06　清华大学　计算机科学与技术　本科
+
+工作经历：
+2018.07 - 2022.03　某互联网大厂　Python 后端工程师
+- 负责核心订单系统重构，基于 FastAPI 与 PostgreSQL
+- 引入 Redis 缓存层，QPS 从 800 提升至 5000
+- 主导服务容器化迁移，全面落地 Docker + Kubernetes
+
+2022.04 - 至今　某 SaaS 公司　高级后端工程师
+- 设计微服务架构，负责支付与账单模块
+- 接入 Azure OpenAI 实现智能客服分流，准确率 92%
+- 搭建 GitHub Actions CI/CD 流水线，发布效率提升 60%
+
+技能：
+- 编程语言：Python（精通）、Go（熟悉）、SQL
+- 框架：FastAPI、Django、Flask
+- 数据库：PostgreSQL、Redis、MongoDB
+- 云与容器：Azure、Docker、Kubernetes、Terraform
+- AI/ML：Azure OpenAI、LangChain、RAG、Prompt Engineering
+- DevOps：GitHub Actions、Prometheus、Grafana
+
+项目亮点：
+- 主导跨团队的支付系统升级，节省 30% 运营成本
+- 持续 3 年获得部门「年度优秀工程师」
+
+工作年限：7 年

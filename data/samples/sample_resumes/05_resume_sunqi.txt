@@ -1,0 +1,35 @@
+姓名：孙七
+手机：13600003333
+邮箱：sunqi@cool.io
+
+教育背景：
+2013.09 - 2017.06　复旦大学　数学与应用数学　本科
+2017.09 - 2019.06　复旦大学　数据科学　硕士
+
+工作经历：
+2019.07 - 2022.06　某券商　量化研究员
+- 使用 Python 开发量化策略
+- Pandas / NumPy 数据分析
+- 与交易团队跨部门协作
+
+2022.07 - 至今　某金融科技公司　高级 Python 工程师
+- 使用 FastAPI 构建交易回测平台
+- PostgreSQL 海量数据存储与查询优化
+- Redis 用于实时行情缓存
+- AWS / Azure 多云部署
+- 引入 Azure OpenAI 做研报摘要，节省分析师 40% 时间
+
+技能：
+- 编程语言：Python（精通）、SQL、Go
+- 框架：FastAPI、Flask
+- 数据库：PostgreSQL、Redis、ClickHouse
+- 云：AWS、Azure
+- 容器：Docker、Kubernetes
+- AI：Azure OpenAI、LangChain、NLP
+- 数据：Pandas、NumPy、Spark
+
+项目亮点：
+- 主导回测平台从 0 到 1，支撑日均 100 万次回测请求
+- 撰写技术分享 30+ 篇，多次在公司技术大会主讲
+
+工作年限：6 年
