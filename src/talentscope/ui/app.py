@@ -8,8 +8,10 @@ TalentScope Streamlit 控制台
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +33,315 @@ from talentscope.core import llm_client
 from talentscope.pipeline import ResumeInput, run as run_pipeline, run_from_library
 
 FEEDBACK_OPTIONS = ["未反馈", "通过", "存疑", "淘汰", "录用", "面试后不符"]
+AUTH_STORE_PATH = ROOT / "config" / "auth_users.json"
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _password_valid(password: str) -> tuple[bool, str]:
+    if len(password) < 8:
+        return False, "密码至少 8 位。"
+    if not any(c.isupper() for c in password):
+        return False, "密码需包含至少 1 个大写字母。"
+    if not any(c.islower() for c in password):
+        return False, "密码需包含至少 1 个小写字母。"
+    if not any(c.isdigit() for c in password):
+        return False, "密码需包含至少 1 个数字。"
+    return True, ""
+
+
+def _default_auth_users() -> dict[str, dict]:
+    return {
+        "admin": {
+            "display_name": "系统管理员",
+            "role": "admin",
+            "enabled": True,
+            "password_hash": _sha256("Admin@123"),
+            "force_password_change": True,
+        },
+        "hr": {
+            "display_name": "HR 用户",
+            "role": "hr",
+            "enabled": True,
+            "password_hash": _sha256("Hr@123"),
+            "force_password_change": True,
+        },
+    }
+
+
+def _normalize_auth_users(raw_users: dict) -> dict[str, dict]:
+    users: dict[str, dict] = {}
+    for uname, item in raw_users.items():
+        if not isinstance(item, dict):
+            continue
+        username = str(uname).strip().lower()
+        if not username:
+            continue
+        role = str(item.get("role", "hr")).lower()
+        if role not in {"admin", "hr"}:
+            role = "hr"
+
+        pwd_hash = str(item.get("password_hash", "")).strip()
+        # 兼容旧字段 password，并立即升级为 hash 持久化
+        legacy_pwd = str(item.get("password", ""))
+        if not pwd_hash and legacy_pwd:
+            pwd_hash = _sha256(legacy_pwd)
+
+        if not pwd_hash:
+            continue
+
+        users[username] = {
+            "display_name": item.get("display_name", username),
+            "role": role,
+            "enabled": bool(item.get("enabled", True)),
+            "password_hash": pwd_hash,
+            "force_password_change": bool(item.get("force_password_change", False)),
+        }
+    return users
+
+
+def _save_auth_users(path: Path, users: dict[str, dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"users": users}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_auth_users() -> tuple[dict[str, dict], Path]:
+    # 1) 本地持久化文件优先
+    if AUTH_STORE_PATH.exists():
+        try:
+            data = json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
+            users = _normalize_auth_users(data.get("users", {})) if isinstance(data, dict) else {}
+            if users:
+                return users, AUTH_STORE_PATH
+        except Exception:
+            pass
+
+    # 2) 若本地不存在，则尝试 secrets / env 作为首次引导数据
+    seed_users: dict[str, dict] = {}
+    try:
+        secret_users = st.secrets.get("auth_users", None)
+        if isinstance(secret_users, dict):
+            seed_users = secret_users
+        elif isinstance(secret_users, list):
+            temp = {}
+            for item in secret_users:
+                if not isinstance(item, dict):
+                    continue
+                username = str(item.get("username", "")).strip().lower()
+                if username:
+                    temp[username] = item
+            seed_users = temp
+    except Exception:
+        seed_users = {}
+
+    if not seed_users:
+        raw = os.getenv("TALENTSCOPE_AUTH_USERS_JSON", "").strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    seed_users = data
+            except Exception:
+                seed_users = {}
+
+    users = _normalize_auth_users(seed_users) if seed_users else _default_auth_users()
+    _save_auth_users(AUTH_STORE_PATH, users)
+    return users, AUTH_STORE_PATH
+
+
+def _verify_user(auth_users: dict[str, dict], username: str, password: str) -> dict | None:
+    user = auth_users.get(username)
+    if not user:
+        return None
+
+    if not bool(user.get("enabled", True)):
+        return None
+
+    pwd_hash = str(user.get("password_hash", "")).strip()
+    if not pwd_hash or _sha256(password) != pwd_hash:
+        return None
+
+    role = str(user.get("role", "hr")).lower()
+    if role not in {"admin", "hr"}:
+        role = "hr"
+
+    return {
+        "username": username,
+        "display_name": user.get("display_name", username),
+        "role": role,
+        "force_password_change": bool(user.get("force_password_change", False)),
+    }
+
+
+def _ensure_auth(auth_users: dict[str, dict]) -> dict:
+    if "auth_user" not in st.session_state:
+        st.session_state["auth_user"] = None
+
+    user = st.session_state.get("auth_user")
+    if user:
+        return user
+
+    st.markdown("## 🔐 登录入口")
+    st.caption("管理员可操作后台配置与数据维护；HR 用户仅可浏览、筛选与发起简历评分。")
+
+    with st.form("login_form", clear_on_submit=False):
+        l1, l2 = st.columns(2)
+        with l1:
+            username = st.text_input("账号", placeholder="请输入账号，例如 admin 或 hr")
+        with l2:
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+        submit = st.form_submit_button("登录", width="stretch")
+
+    if submit:
+        authed = _verify_user(auth_users, username.strip().lower(), password)
+        if authed:
+            st.session_state["auth_user"] = authed
+            st.success(f"登录成功：{authed['display_name']}（{authed['role'].upper()}）")
+            st.rerun()
+        st.error("账号或密码错误，请重试。")
+
+    st.info("首次启动默认账号：admin / Admin@123，hr / Hr@123。首次登录将强制改密。")
+    st.stop()
+
+
+def _enforce_password_change(auth_users: dict[str, dict], auth_path: Path, auth_user: dict) -> None:
+    username = str(auth_user.get("username", "")).lower()
+    row = auth_users.get(username, {})
+    if not row.get("force_password_change", False):
+        return
+
+    st.warning("🔐 安全要求：首次登录或重置后必须先修改密码。")
+    with st.form("force_change_password_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            p1 = st.text_input("新密码", type="password", placeholder="至少 8 位，含大小写与数字")
+        with c2:
+            p2 = st.text_input("确认新密码", type="password")
+        submit = st.form_submit_button("更新密码", width="stretch")
+
+    if submit:
+        if p1 != p2:
+            st.error("两次输入的密码不一致。")
+            st.stop()
+        ok, msg = _password_valid(p1)
+        if not ok:
+            st.error(msg)
+            st.stop()
+
+        auth_users[username]["password_hash"] = _sha256(p1)
+        auth_users[username]["force_password_change"] = False
+        _save_auth_users(auth_path, auth_users)
+
+        refreshed = _verify_user(auth_users, username, p1)
+        if refreshed:
+            st.session_state["auth_user"] = refreshed
+        st.success("密码更新成功，请继续使用系统。")
+        st.rerun()
+
+    st.stop()
+
+
+def _render_account_admin_panel(auth_users: dict[str, dict], auth_path: Path, current_user: str) -> None:
+    st.markdown("### 👥 账号管理")
+    st.caption("管理员可新增账号、启停账号、重置密码。重置后将强制用户首次登录改密。")
+
+    view_rows = []
+    for username, item in sorted(auth_users.items()):
+        view_rows.append({
+            "账号": username,
+            "显示名": item.get("display_name", username),
+            "角色": "管理员" if item.get("role") == "admin" else "HR",
+            "启用": "是" if item.get("enabled", True) else "否",
+            "需改密": "是" if item.get("force_password_change", False) else "否",
+        })
+    st.dataframe(pd.DataFrame(view_rows), width="stretch", hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.form("create_user_form", clear_on_submit=True):
+            st.markdown("**➕ 新增账号**")
+            new_username = st.text_input("账号（英文/数字）", placeholder="例如 hr_south")
+            new_display = st.text_input("显示名", placeholder="例如 华南 HR")
+            new_role = st.selectbox("角色", ["hr", "admin"], format_func=lambda x: "HR" if x == "hr" else "管理员")
+            new_password = st.text_input("初始密码", type="password", placeholder="至少 8 位，含大小写与数字")
+            new_enabled = st.checkbox("创建后立即启用", value=True)
+            create_submit = st.form_submit_button("创建账号", width="stretch")
+
+        if create_submit:
+            uname = new_username.strip().lower()
+            if not uname:
+                st.error("账号不能为空。")
+            elif uname in auth_users:
+                st.error("账号已存在。")
+            else:
+                ok, msg = _password_valid(new_password)
+                if not ok:
+                    st.error(msg)
+                else:
+                    auth_users[uname] = {
+                        "display_name": (new_display or uname).strip(),
+                        "role": new_role,
+                        "enabled": bool(new_enabled),
+                        "password_hash": _sha256(new_password),
+                        "force_password_change": True,
+                    }
+                    _save_auth_users(auth_path, auth_users)
+                    st.success(f"已创建账号：{uname}")
+                    st.rerun()
+
+    with c2:
+        st.markdown("**🔧 账号维护**")
+        usernames = sorted(auth_users.keys())
+        if not usernames:
+            st.info("暂无账号。")
+            return
+
+        picked = st.selectbox("选择账号", usernames, key="auth_pick_user")
+        target = auth_users[picked]
+
+        new_state = st.selectbox(
+            "账号状态",
+            ["enabled", "disabled"],
+            index=0 if target.get("enabled", True) else 1,
+            format_func=lambda x: "启用" if x == "enabled" else "停用",
+            key="auth_user_state",
+        )
+        if st.button("保存账号状态", key="auth_save_state", width="stretch"):
+            if picked == current_user and new_state == "disabled":
+                st.error("不能停用当前登录账号。")
+            else:
+                if target.get("role") == "admin" and new_state == "disabled":
+                    enabled_admins = [
+                        u for u, item in auth_users.items()
+                        if item.get("role") == "admin" and item.get("enabled", True) and u != picked
+                    ]
+                    if not enabled_admins:
+                        st.error("至少需要保留 1 个启用状态的管理员账号。")
+                        st.stop()
+                auth_users[picked]["enabled"] = new_state == "enabled"
+                _save_auth_users(auth_path, auth_users)
+                st.success("账号状态已更新。")
+                st.rerun()
+
+        reset_pwd = st.text_input(
+            "重置为临时密码",
+            type="password",
+            placeholder="重置后该用户下次登录必须改密",
+            key="auth_reset_pwd",
+        )
+        if st.button("重置密码", key="auth_reset_pwd_btn", width="stretch"):
+            ok, msg = _password_valid(reset_pwd)
+            if not ok:
+                st.error(msg)
+            else:
+                auth_users[picked]["password_hash"] = _sha256(reset_pwd)
+                auth_users[picked]["force_password_change"] = True
+                _save_auth_users(auth_path, auth_users)
+                st.success(f"已重置账号 {picked} 的密码。")
+                st.rerun()
 
 
 def _fmt_lang(x, key="level"):
@@ -723,6 +1034,13 @@ LANG_LEVELS = lang_cfg.get("levels", ["入门", "日常", "流利", "母语"])
 DEPT_NAMES = [d["name"] for d in dept_cfg["departments"]]
 TEMPLATES = template_cfg.get("templates", [])
 
+# ---------------- 登录与角色 ----------------
+AUTH_USERS, AUTH_PATH = _load_auth_users()
+AUTH_USER = _ensure_auth(AUTH_USERS)
+_enforce_password_change(AUTH_USERS, AUTH_PATH, AUTH_USER)
+IS_ADMIN = AUTH_USER.get("role") == "admin"
+ROLE_TEXT = "管理员" if IS_ADMIN else "HR 用户"
+
 # ---------------- 顶部状态条（玻璃卡） ----------------
 c1, c2, c3, c4 = st.columns(4)
 _llm = cfg.get("llm", {})
@@ -757,9 +1075,9 @@ with c3:
     )
 with c4:
     st.markdown(
-        f'<div class="glass-card"><div class="label">🌐 配置库</div>'
-        f'<div class="value">{len(LANG_NAMES)} 语种</div>'
-        f'<div class="sub">{len(DEPT_NAMES)} 个部门 · 全部可 DIY</div></div>',
+        f'<div class="glass-card"><div class="label">👤 当前身份</div>'
+        f'<div class="value">{ROLE_TEXT}</div>'
+        f'<div class="sub">{AUTH_USER.get("display_name", AUTH_USER.get("username", ""))}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1009,6 +1327,8 @@ with tab1:
 with tab2:
     st.info("🚀 新入职人员接入建议：先导入简历到人才库 → 自动解析评分要素 → 再在岗位补位流程中统一筛选，确保岗位填补无缝衔接。")
     st.subheader("📥 批量导入简历到人才库")
+    if not IS_ADMIN:
+        st.caption("当前为 HR 只读权限：可浏览与筛选，导入/编辑/删除/反馈维护仅管理员可操作。")
     imp_col1, imp_col2 = st.columns([2, 1])
     with imp_col1:
         imp_files = st.file_uploader(
@@ -1019,7 +1339,7 @@ with tab2:
     with imp_col2:
         imp_dept = st.selectbox("归属部门", DEPT_NAMES, key="imp_dept")
 
-    if st.button("🚀 开始导入", type="primary", disabled=not imp_files):
+    if st.button("🚀 开始导入", type="primary", disabled=(not imp_files) or (not IS_ADMIN)):
         prog = st.progress(0.0)
         ok, fail = 0, 0
         for i, f in enumerate(imp_files):
@@ -1111,13 +1431,13 @@ with tab2:
                 new_notes = st.text_area("备注", rec.notes, key=f"ed_no_{rec.id}", height=100)
             b1, b2 = st.columns(2)
             with b1:
-                if st.button("💾 保存修改", key=f"sv_{rec.id}", width="stretch"):
+                if st.button("💾 保存修改", key=f"sv_{rec.id}", width="stretch", disabled=not IS_ADMIN):
                     lib.update_record(rec.id, display_name=new_name,
                                        department=new_dept, notes=new_notes)
                     st.success("已保存")
                     st.rerun()
             with b2:
-                if st.button("🗑️ 删除", key=f"del_{rec.id}", type="secondary", width="stretch"):
+                if st.button("🗑️ 删除", key=f"del_{rec.id}", type="secondary", width="stretch", disabled=not IS_ADMIN):
                     lib.delete_record(rec.id)
                     st.warning("已删除")
                     st.rerun()
@@ -1144,7 +1464,7 @@ with tab2:
                     height=110,
                     placeholder="例如：面试通过，项目深度符合预期；或：关键词匹配高，但实操深度不足。",
                 )
-            if st.button("💾 保存反馈", key=f"fb_save_{rec.id}", width="stretch"):
+            if st.button("💾 保存反馈", key=f"fb_save_{rec.id}", width="stretch", disabled=not IS_ADMIN):
                 lib.update_feedback(rec.id, feedback_status, feedback_note)
                 st.success("反馈已保存，可用于后续试点评测和规则校准。")
                 st.rerun()
@@ -1158,6 +1478,12 @@ with tab2:
 # Tab 3 · 语言 & 部门管理（管理员 DIY）
 # ===================================================================
 with tab3:
+    if not IS_ADMIN:
+        st.warning("当前账号为 HR 用户：管理员设置仅可查看，不可修改。")
+    else:
+        _render_account_admin_panel(AUTH_USERS, AUTH_PATH, AUTH_USER.get("username", ""))
+        st.markdown("---")
+
     # ============ 🤖 LLM 模型选择（管理员） ============
     st.markdown(
         """
@@ -1319,9 +1645,9 @@ with tab3:
 
         bsave, btest = st.columns(2)
         with bsave:
-            do_save = st.form_submit_button("💾 保存配置", width="stretch")
+            do_save = st.form_submit_button("💾 保存配置", width="stretch", disabled=not IS_ADMIN)
         with btest:
-            do_test = st.form_submit_button("🧪 保存并连接测试", width="stretch")
+            do_test = st.form_submit_button("🧪 保存并连接测试", width="stretch", disabled=not IS_ADMIN)
 
     if do_save or do_test:
         err = None
@@ -1400,7 +1726,7 @@ with tab3:
             st.markdown("**➕ 新增语言**")
             n = st.text_input("名称 *（如：荷兰语）")
             c = st.text_input("ISO 代码（如：nl）")
-            if st.form_submit_button("添加", width="stretch"):
+            if st.form_submit_button("添加", width="stretch", disabled=not IS_ADMIN):
                 if not n.strip():
                     st.error("请填写名称")
                 elif any(x["name"] == n for x in lang_cfg["languages"]):
@@ -1415,7 +1741,7 @@ with tab3:
         custom_langs = [l["name"] for l in lang_cfg["languages"] if not l.get("builtin")]
         if custom_langs:
             to_del = st.selectbox("选择", custom_langs, key="del_lang_pick")
-            if st.button("删除该语言", key="del_lang_btn"):
+            if st.button("删除该语言", key="del_lang_btn", disabled=not IS_ADMIN):
                 lang_cfg["languages"] = [l for l in lang_cfg["languages"] if l["name"] != to_del]
                 save_languages(lang_cfg)
                 st.warning(f"已删除：{to_del}")
@@ -1436,7 +1762,7 @@ with tab3:
         with st.form("add_dept"):
             st.markdown("**➕ 新增部门**")
             nd = st.text_input("部门名称 *")
-            if st.form_submit_button("添加", width="stretch"):
+            if st.form_submit_button("添加", width="stretch", disabled=not IS_ADMIN):
                 if not nd.strip():
                     st.error("请填写名称")
                 elif any(x["name"] == nd for x in dept_cfg["departments"]):
@@ -1451,7 +1777,7 @@ with tab3:
         custom_depts = [d["name"] for d in dept_cfg["departments"] if not d.get("builtin")]
         if custom_depts:
             to_del_d = st.selectbox("选择", custom_depts, key="del_dept_pick")
-            if st.button("删除该部门", key="del_dept_btn"):
+            if st.button("删除该部门", key="del_dept_btn", disabled=not IS_ADMIN):
                 dept_cfg["departments"] = [d for d in dept_cfg["departments"] if d["name"] != to_del_d]
                 save_departments(dept_cfg)
                 st.warning(f"已删除：{to_del_d}")
@@ -1504,14 +1830,19 @@ with st.sidebar:
     )
 
     st.markdown("### ⚙️ 操作")
-    if st.button("🔄 重新加载配置", width="stretch"):
+    st.markdown(f"当前登录：**{AUTH_USER.get('display_name', AUTH_USER.get('username', ''))}**（{ROLE_TEXT}）")
+    if st.button("🚪 退出登录", width="stretch"):
+        st.session_state["auth_user"] = None
+        st.rerun()
+
+    if st.button("🔄 重新加载配置", width="stretch", disabled=not IS_ADMIN):
         llm_client.reset_client()
         reload_config()
         st.cache_data.clear()
         st.success("已重置")
         st.rerun()
 
-    if st.button("📂 打开输出目录", width="stretch"):
+    if st.button("📂 打开输出目录", width="stretch", disabled=not IS_ADMIN):
         import os
         out = get_root() / cfg["storage"]["output_dir"]
         if sys.platform == "win32":
