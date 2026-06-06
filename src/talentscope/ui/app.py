@@ -214,20 +214,30 @@ def _render_attrition_warning_panel(records: list[lib.LibraryRecord]) -> None:
         return
 
     rows = []
+    suggestions = []
     for dept in watch_departments:
         dept_records = [r for r in records if r.department == dept]
         total = len(dept_records)
         ready = sum(1 for r in dept_records if r.feedback_status in {"通过", "录用"})
         uncertain = sum(1 for r in dept_records if r.feedback_status == "存疑")
+        unreviewed = sum(1 for r in dept_records if r.feedback_status == "未反馈")
         warning = "✅ 正常" if ready >= min_ready else "⚠️ 预警"
+        gap = max(0, int(min_ready) - ready)
+        if gap > 0:
+            action = (
+                f"{dept} 缺口 {gap} 人：优先从存疑候选中安排快速复核（当前 {uncertain} 人），"
+                f"并从未反馈候选中补充首轮筛选（当前 {unreviewed} 人）。"
+            )
+            suggestions.append(action)
         rows.append({
             "部门": dept,
             "总人数": total,
             "即战力人数": ready,
             "存疑人数": uncertain,
+            "未反馈人数": unreviewed,
             "阈值": int(min_ready),
             "状态": warning,
-            "缺口": max(0, int(min_ready) - ready),
+            "缺口": gap,
         })
 
     alert_df = pd.DataFrame(rows).sort_values(["状态", "缺口"], ascending=[False, False])
@@ -238,6 +248,102 @@ def _render_attrition_warning_panel(records: list[lib.LibraryRecord]) -> None:
     st.dataframe(alert_df, width="stretch", hide_index=True)
     if alert_count > 0:
         st.error("存在关键岗位后备风险，请优先补充即战力候选人或启动培养计划。")
+        st.markdown("**系统建议动作**")
+        for item in suggestions:
+            st.markdown(f"- {item}")
+
+
+def _estimate_template_fit(record: lib.LibraryRecord, template: dict, lang_levels: list[str]) -> dict:
+    parsed = record.parsed or {}
+    must_skills = {s.lower() for s in template.get("must_have_skills", [])}
+    cv_skills = {s.lower() for s in parsed.get("skills", [])}
+    matched = must_skills & cv_skills
+    skill_rate = len(matched) / len(must_skills) if must_skills else 1.0
+
+    level_idx = {name: i for i, name in enumerate(lang_levels)}
+    cv_lang = {x.get("name"): x.get("level", "") for x in (record.languages or []) if isinstance(x, dict)}
+    lang_total = len(template.get("required_languages", []))
+    lang_hit = 0
+    for req in template.get("required_languages", []):
+        name = req.get("name")
+        req_lvl = req.get("min_level", "日常")
+        cv_lvl = cv_lang.get(name, "")
+        if name in cv_lang and level_idx.get(cv_lvl, -1) >= level_idx.get(req_lvl, -1):
+            lang_hit += 1
+    lang_rate = lang_hit / lang_total if lang_total else 1.0
+
+    req_exp = float(template.get("experience_years", 0) or 0)
+    cv_exp = float(parsed.get("experience_years", 0) or 0)
+    exp_rate = min(cv_exp / req_exp, 1.0) if req_exp > 0 else 1.0
+    fit_score = round((skill_rate * 0.6 + lang_rate * 0.2 + exp_rate * 0.2) * 100, 1)
+
+    return {
+        "fit_score": fit_score,
+        "skill_rate": round(skill_rate * 100, 1),
+        "lang_rate": round(lang_rate * 100, 1),
+        "exp_rate": round(exp_rate * 100, 1),
+        "matched_skills": sorted(matched),
+        "missing_skills": sorted(must_skills - cv_skills),
+    }
+
+
+def _render_template_regression_panel(records: list[lib.LibraryRecord], templates: list[dict], lang_levels: list[str]) -> None:
+    st.markdown("### 🧪 模板回归检查")
+    st.caption("用于验证岗位模板在现有人才库中的可匹配性与风险，避免模板更新后偏离真实供给。")
+    if not templates:
+        st.info("未配置岗位模板。")
+        return
+    if not records:
+        st.info("人才库为空，无法执行模板回归检查。")
+        return
+
+    if st.button("▶ 运行模板回归检查", key="run_template_regression", width="stretch"):
+        overview_rows = []
+        detail_rows = []
+        for tpl in templates:
+            scored = []
+            for rec in records:
+                fit = _estimate_template_fit(rec, tpl, lang_levels)
+                scored.append((rec, fit))
+
+            scored.sort(key=lambda x: x[1]["fit_score"], reverse=True)
+            high_fit = [x for x in scored if x[1]["fit_score"] >= 75]
+            medium_fit = [x for x in scored if 60 <= x[1]["fit_score"] < 75]
+            risk = "低"
+            if len(high_fit) < 2:
+                risk = "高" if len(high_fit) == 0 else "中"
+
+            overview_rows.append({
+                "模板": tpl.get("name", tpl.get("id", "模板")),
+                "版本": tpl.get("version", "-"),
+                "高匹配人数(>=75)": len(high_fit),
+                "中匹配人数(60-74)": len(medium_fit),
+                "模板供给风险": risk,
+            })
+
+            for rec, fit in scored[:5]:
+                detail_rows.append({
+                    "模板": tpl.get("name", tpl.get("id", "模板")),
+                    "候选人": rec.display_name,
+                    "部门": rec.department,
+                    "匹配分": fit["fit_score"],
+                    "技能覆盖率": fit["skill_rate"],
+                    "语言覆盖率": fit["lang_rate"],
+                    "经验满足率": fit["exp_rate"],
+                    "缺失技能": ", ".join(fit["missing_skills"][:4]),
+                })
+
+        ov_df = pd.DataFrame(overview_rows)
+        dt_df = pd.DataFrame(detail_rows)
+        st.dataframe(ov_df, width="stretch", hide_index=True)
+        with st.expander("查看模板 Top 候选详情"):
+            st.dataframe(dt_df, width="stretch", hide_index=True)
+
+        csv1 = ov_df.to_csv(index=False).encode("utf-8-sig")
+        csv2 = dt_df.to_csv(index=False).encode("utf-8-sig")
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 下载模板回归概览 CSV", data=csv1, file_name="template_regression_overview.csv", mime="text/csv", width="stretch")
+        c2.download_button("📥 下载模板候选详情 CSV", data=csv2, file_name="template_regression_top_candidates.csv", mime="text/csv", width="stretch")
 
 
 def _render_workflow_guide() -> None:
@@ -315,7 +421,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- 主题 CSS（深色玻璃 + 渐变） ----------
+# ---------- 主题 CSS（浅色天蓝科技风） ----------
 st.markdown(
     """
     <style>
@@ -325,28 +431,60 @@ st.markdown(
     header[data-testid="stHeader"] {background: transparent;}
 
     /* 主容器底色 */
-    .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px;}
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 2rem;
+        max-width: 1400px;
+        background:
+            radial-gradient(circle at 15% 18%, rgba(125, 211, 252, .16), transparent 32%),
+            radial-gradient(circle at 85% 9%, rgba(56, 189, 248, .14), transparent 28%),
+            radial-gradient(circle at 72% 82%, rgba(186, 230, 253, .30), transparent 38%),
+            linear-gradient(180deg, #f5fbff 0%, #edf7ff 100%);
+        border-radius: 14px;
+    }
 
     /* ===== Hero 头条 ===== */
     .ts-hero {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 45%, #f093fb 100%);
+        background:
+            linear-gradient(120deg, rgba(56, 189, 248, .94) 0%, rgba(59, 130, 246, .88) 52%, rgba(14, 165, 233, .85) 100%),
+            repeating-linear-gradient(
+                135deg,
+                rgba(255, 255, 255, .12) 0,
+                rgba(255, 255, 255, .12) 1px,
+                transparent 1px,
+                transparent 12px
+            );
         padding: 28px 32px;
         border-radius: 18px;
         color: #fff;
         margin-bottom: 18px;
-        box-shadow: 0 10px 30px rgba(102,126,234,.35);
+        box-shadow: 0 10px 28px rgba(14, 116, 144, .26);
         position: relative;
         overflow: hidden;
     }
     .ts-hero::before {
-        content: ""; position: absolute; right: -60px; top: -60px;
-        width: 220px; height: 220px; border-radius: 50%;
-        background: rgba(255,255,255,.08);
+        content: "";
+        position: absolute;
+        right: -20px;
+        top: -22px;
+        width: 260px;
+        height: 260px;
+        border-radius: 50%;
+        border: 2px solid rgba(255,255,255,.34);
+        box-shadow:
+            0 0 0 22px rgba(255,255,255,.10),
+            0 0 0 44px rgba(255,255,255,.07);
     }
     .ts-hero::after {
-        content: ""; position: absolute; right: 80px; bottom: -90px;
-        width: 180px; height: 180px; border-radius: 50%;
-        background: rgba(255,255,255,.06);
+        content: "AI";
+        position: absolute;
+        right: 30px;
+        bottom: 8px;
+        font-size: 84px;
+        font-weight: 800;
+        letter-spacing: 4px;
+        color: rgba(255,255,255,.16);
+        text-shadow: 0 1px 0 rgba(255,255,255,.2);
     }
     .ts-hero h1 {
         font-size: 34px; font-weight: 800; margin: 0 0 6px 0;
@@ -366,12 +504,12 @@ st.markdown(
 
     /* ===== 玻璃质感状态卡 ===== */
     .glass-card {
-        background: linear-gradient(135deg, rgba(255,255,255,.85) 0%, rgba(245,247,250,.65) 100%);
+        background: linear-gradient(145deg, rgba(255,255,255,.96) 0%, rgba(238,248,255,.78) 100%);
         backdrop-filter: blur(10px);
-        border: 1px solid rgba(255,255,255,.6);
+        border: 1px solid rgba(186, 230, 253, .9);
         border-radius: 14px;
         padding: 16px 18px;
-        box-shadow: 0 4px 14px rgba(17,17,26,.06);
+        box-shadow: 0 6px 18px rgba(14, 116, 144, .10);
         transition: transform .18s ease, box-shadow .18s ease;
         height: 100%;
     }
@@ -386,7 +524,7 @@ st.markdown(
     }
     .glass-card .value {
         font-size: 18px; font-weight: 700;
-        background: linear-gradient(90deg, #667eea, #764ba2);
+        background: linear-gradient(90deg, #0284c7, #0369a1);
         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         background-clip: text;
     }
@@ -396,8 +534,8 @@ st.markdown(
 
     /* ===== 模型选择卡片 ===== */
     .model-card {
-        background: linear-gradient(135deg, #f8fafc, #ffffff);
-        border: 1px solid #e5e7eb; border-radius: 12px;
+        background: linear-gradient(135deg, #f0f9ff, #ffffff);
+        border: 1px solid #bae6fd; border-radius: 12px;
         padding: 14px 16px; margin-bottom: 10px;
     }
     .model-card .head {
@@ -417,14 +555,14 @@ st.markdown(
         gap: 8px; border-bottom: none;
     }
     .stTabs [data-baseweb="tab"] {
-        background: #f1f5f9; border-radius: 10px 10px 0 0;
+        background: #e0f2fe; border-radius: 10px 10px 0 0;
         padding: 10px 22px; font-weight: 600;
         border: none !important;
     }
     .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #667eea, #764ba2) !important;
+        background: linear-gradient(135deg, #38bdf8, #0ea5e9) !important;
         color: white !important;
-        box-shadow: 0 4px 12px rgba(102,126,234,.3);
+        box-shadow: 0 4px 12px rgba(14,165,233,.35);
     }
 
     /* ===== 按钮强化 ===== */
@@ -434,10 +572,10 @@ st.markdown(
     }
     .stButton > button:hover, .stDownloadButton > button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 6px 14px rgba(102,126,234,.25);
+        box-shadow: 0 6px 14px rgba(14,165,233,.25);
     }
     .stForm button[kind="formSubmit"] {
-        background: linear-gradient(135deg, #667eea, #764ba2);
+        background: linear-gradient(135deg, #38bdf8, #0284c7);
         color: white; border: none;
     }
 
@@ -451,7 +589,7 @@ st.markdown(
     hr {
         border: none;
         height: 1px;
-        background: linear-gradient(90deg, transparent, #cbd5e1, transparent);
+        background: linear-gradient(90deg, transparent, #7dd3fc, transparent);
         margin: 18px 0;
     }
     </style>
@@ -830,6 +968,7 @@ with tab2:
             st.bar_chart(pd.Series(stats1["by_feedback"]))
 
     _render_feedback_metrics()
+    _render_template_regression_panel(lib.list_records(), TEMPLATES, LANG_LEVELS)
     _render_attrition_warning_panel(lib.list_records())
 
     fcol1, fcol2, fcol3, fcol4 = st.columns(4)

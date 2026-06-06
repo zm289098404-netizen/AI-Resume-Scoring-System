@@ -168,6 +168,14 @@ talentscope/
 .venv/Scripts/python.exe scripts/evaluate_feedback.py
 ```
 
+模板库回归检查：
+
+```bash
+.venv/Scripts/python.exe scripts/template_regression_check.py
+```
+
+用于检验岗位模板在当前人才库中的供给风险，避免模板升级后出现“模板过严/过宽”导致的筛选偏差。
+
 ---
 
 ## 🧭 岗位补位落地流程
