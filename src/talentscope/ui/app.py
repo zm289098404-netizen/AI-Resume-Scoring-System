@@ -139,6 +139,73 @@ def _render_feedback_metrics() -> None:
     st.caption("说明：当前评测基于人才库中的人工反馈状态汇总，用于试点阶段观察正向/负向反馈分布与覆盖率。")
 
 
+def _render_workflow_guide() -> None:
+    st.markdown("### 🧭 业务落地流程")
+    st.markdown(
+        """
+        1. **岗位补位**：输入 JD 或岗位需求，勾选关键技能与语言要求。
+        2. **人才筛选**：优先从简历库筛选候选人，必要时补充临时上传或新入职简历。
+        3. **后备池分层**：系统自动生成 A/B/C 三层后备池并提示岗位连续性风险。
+        4. **人工复核**：根据评分证据、建议追问和核验项完成面试决策。
+        5. **反馈沉淀**：将结果写回反馈闭环，持续提升岗位匹配质量。
+        """
+    )
+
+
+def _backup_band(score: float, confidence: float, threshold: int) -> str:
+    if score >= threshold + 10 and confidence >= 75:
+        return "A-即战力"
+    if score >= threshold - 5 and confidence >= 60:
+        return "B-培养型"
+    return "C-观察池"
+
+
+def _render_backup_pool(df: pd.DataFrame, threshold: int, vacancy_target: int) -> None:
+    if df.empty:
+        return
+
+    pool_df = df.copy()
+    pool_df["置信度"] = pd.to_numeric(pool_df["置信度"], errors="coerce").fillna(0)
+    pool_df["后备层级"] = pool_df.apply(
+        lambda r: _backup_band(float(r["总分"]), float(r["置信度"]), threshold),
+        axis=1,
+    )
+    pool_df["补位指数"] = (pool_df["总分"] * 0.7 + pool_df["置信度"] * 0.3).round(1)
+
+    ranked = pool_df.sort_values(["补位指数", "总分"], ascending=False)
+    shortlist_size = max(vacancy_target * 3, 5)
+    shortlist = ranked.head(shortlist_size)
+
+    ready_count = int((shortlist["后备层级"] == "A-即战力").sum())
+    backup_count = int((shortlist["后备层级"] == "B-培养型").sum())
+    risk_level = "低"
+    if ready_count < vacancy_target:
+        risk_level = "高" if ready_count == 0 else "中"
+
+    st.markdown("## 🧩 岗位补位后备池")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("补位目标人数", vacancy_target)
+    b2.metric("A层即战力", ready_count)
+    b3.metric("B层培养型", backup_count)
+    b4.metric("岗位连续性风险", risk_level)
+
+    st.caption("A 层可直接补位，B 层可定向培养，C 层建议暂不纳入近期补位计划。")
+    st.dataframe(
+        shortlist[["姓名", "部门", "总分", "置信度", "后备层级", "补位指数", "状态", "推荐理由"]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    csv = shortlist.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 下载岗位后备池 CSV",
+        data=csv,
+        file_name="succession_pool.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+
 # ---------------- 页面配置 ----------------
 st.set_page_config(
     page_title="TalentScope · AI 简历匹配评分",
@@ -376,6 +443,9 @@ tab1, tab2, tab3 = st.tabs([
 # Tab 1 · JD 匹配评分
 # ===================================================================
 with tab1:
+    _render_workflow_guide()
+    st.markdown("---")
+
     left, right = st.columns([1, 1])
 
     with left:
@@ -462,6 +532,8 @@ with tab1:
         st.subheader("⑤ 评分参数")
         threshold = st.slider("通过门槛分数", 0, 100, cfg["scoring"].get("min_score_threshold", 60))
         top_n = st.slider("展示 Top N", 1, 50, 10)
+        vacancy_target = st.slider("岗位补位目标人数", 1, 10, 3)
+        enable_backup_pool = st.checkbox("启用岗位连续性补位分析", value=True)
 
     st.markdown("---")
     can_run = bool(jd_text.strip()) and (
@@ -505,6 +577,9 @@ with tab1:
 
         st.markdown("## 📊 评分结果")
         rows = []
+        feedback_map = {}
+        if src == "🗂️ 从简历库选人":
+            feedback_map = {r.id: r.feedback_status for r in picked_records}
         for c in result.candidates:
             if "error" in c:
                 rows.append({"姓名": c["file"], "部门": c.get("department", "—"),
@@ -529,6 +604,7 @@ with tab1:
                 "缺失技能": ", ".join(m.get("missing_skills", [])),
                 "匹配语言": matched_l,
                 "缺失语言": missing_l,
+                "反馈状态": feedback_map.get(c.get("library_id", ""), "未反馈"),
                 "推荐理由": m.get("recommendation", ""),
             })
         df = pd.DataFrame(rows).sort_values("总分", ascending=False).head(top_n).reset_index(drop=True)
@@ -558,12 +634,15 @@ with tab1:
         with st.expander("🔍 查看 JD 解析结果"):
             st.json(result.jd)
         _render_result_details(result.candidates, threshold)
+        if enable_backup_pool:
+            _render_backup_pool(df, threshold, vacancy_target)
 
 
 # ===================================================================
 # Tab 2 · 简历库管理
 # ===================================================================
 with tab2:
+    st.info("🚀 新入职人员接入建议：先导入简历到人才库 → 自动解析评分要素 → 再在岗位补位流程中统一筛选，确保岗位填补无缝衔接。")
     st.subheader("📥 批量导入简历到人才库")
     imp_col1, imp_col2 = st.columns([2, 1])
     with imp_col1:
