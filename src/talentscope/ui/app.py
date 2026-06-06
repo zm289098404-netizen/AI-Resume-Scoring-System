@@ -9,6 +9,7 @@ TalentScope Streamlit 控制台
 from __future__ import annotations
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -252,6 +253,32 @@ def _render_attrition_warning_panel(records: list[lib.LibraryRecord]) -> None:
         for item in suggestions:
             st.markdown(f"- {item}")
 
+        task_rows = []
+        for _, row in alert_df.iterrows():
+            if row["状态"] != "⚠️ 预警":
+                continue
+            task_rows.append({
+                "部门": row["部门"],
+                "任务类型": "紧急补位",
+                "优先级": "P1" if int(row["缺口"]) >= 2 else "P2",
+                "建议动作": f"在 3 个工作日内补齐 {int(row['缺口'])} 名即战力候选",
+                "执行建议": "优先复核存疑候选，其次从未反馈候选发起首轮筛选",
+                "负责人": "HRBP / 用人经理",
+            })
+
+        if task_rows:
+            st.markdown("**自动生成补位任务清单**")
+            task_df = pd.DataFrame(task_rows)
+            st.dataframe(task_df, width="stretch", hide_index=True)
+            task_csv = task_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下载补位任务清单 CSV",
+                data=task_csv,
+                file_name="attrition_recovery_tasks.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
 
 def _estimate_template_fit(record: lib.LibraryRecord, template: dict, lang_levels: list[str]) -> dict:
     parsed = record.parsed or {}
@@ -344,6 +371,71 @@ def _render_template_regression_panel(records: list[lib.LibraryRecord], template
         c1, c2 = st.columns(2)
         c1.download_button("📥 下载模板回归概览 CSV", data=csv1, file_name="template_regression_overview.csv", mime="text/csv", width="stretch")
         c2.download_button("📥 下载模板候选详情 CSV", data=csv2, file_name="template_regression_top_candidates.csv", mime="text/csv", width="stretch")
+
+
+def _safe_read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _render_ops_trend_panel() -> None:
+    st.markdown("### 📉 运营趋势看板")
+    out_dir = get_root() / cfg["storage"]["output_dir"]
+    feedback_files = sorted(out_dir.glob("feedback-evaluation-*.json"), reverse=True)[:12]
+    regression_files = sorted(out_dir.glob("template-regression-*.json"), reverse=True)[:12]
+
+    feedback_rows = []
+    for path in reversed(feedback_files):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        feedback_rows.append({
+            "批次": path.stem.replace("feedback-evaluation-", ""),
+            "反馈覆盖率": float(data.get("feedback_coverage", 0)),
+            "正向反馈率": float(data.get("positive_rate", 0)),
+            "负向反馈率": float(data.get("negative_rate", 0)),
+            "候选人总数": int(data.get("total_candidates", 0)),
+        })
+
+    regression_rows = []
+    for path in reversed(regression_files):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        templates = data.get("templates", [])
+        high_risk = sum(1 for t in templates if t.get("supply_risk") == "高")
+        mid_risk = sum(1 for t in templates if t.get("supply_risk") == "中")
+        regression_rows.append({
+            "批次": path.stem.replace("template-regression-", ""),
+            "高风险模板数": high_risk,
+            "中风险模板数": mid_risk,
+            "模板总数": len(templates),
+        })
+
+    if not feedback_rows and not regression_rows:
+        st.info("暂未发现趋势数据。请先运行反馈评测或模板回归检查。")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**反馈趋势（最近 12 批）**")
+        if feedback_rows:
+            fb_df = pd.DataFrame(feedback_rows)
+            st.line_chart(fb_df.set_index("批次")[["反馈覆盖率", "正向反馈率", "负向反馈率"]])
+            st.dataframe(fb_df, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无反馈趋势数据。")
+
+    with c2:
+        st.markdown("**模板供给风险趋势（最近 12 批）**")
+        if regression_rows:
+            rg_df = pd.DataFrame(regression_rows)
+            st.line_chart(rg_df.set_index("批次")[["高风险模板数", "中风险模板数"]])
+            st.dataframe(rg_df, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无模板风险趋势数据。")
 
 
 def _render_workflow_guide() -> None:
@@ -1367,6 +1459,8 @@ with tab3:
         else:
             st.caption("（暂无自定义部门）")
 
+    st.markdown("---")
+    _render_ops_trend_panel()
     st.markdown("---")
     _render_governance_panel()
 
