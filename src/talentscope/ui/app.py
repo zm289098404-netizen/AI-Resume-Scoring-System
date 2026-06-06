@@ -117,6 +117,28 @@ def _render_governance_panel() -> None:
         )
 
 
+def _render_feedback_metrics() -> None:
+    summary = lib.summarize_feedback()
+    st.markdown("### 📈 试点评测概览")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("反馈覆盖率", f"{summary['feedback_coverage']}%")
+    c2.metric("正向反馈率", f"{summary['positive_rate']}%")
+    c3.metric("负向反馈率", f"{summary['negative_rate']}%")
+    c4.metric("存疑占比", f"{summary['neutral_rate']}%")
+
+    if summary["records"]:
+        eval_df = pd.DataFrame(summary["records"])
+        csv = eval_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 下载反馈评测 CSV",
+            data=csv,
+            file_name="feedback_evaluation.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    st.caption("说明：当前评测基于人才库中的人工反馈状态汇总，用于试点阶段观察正向/负向反馈分布与覆盖率。")
+
+
 # ---------------- 页面配置 ----------------
 st.set_page_config(
     page_title="TalentScope · AI 简历匹配评分",
@@ -592,6 +614,8 @@ with tab2:
     if stats1.get("by_feedback"):
         with st.expander("🗳️ 反馈状态分布"):
             st.bar_chart(pd.Series(stats1["by_feedback"]))
+
+    _render_feedback_metrics()
 
     fcol1, fcol2, fcol3, fcol4 = st.columns(4)
     with fcol1:

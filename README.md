@@ -7,6 +7,7 @@
 ## ✨ 特性
 
 - **🚀 一键启动**：双击 `start.bat`，自动完成环境检测 → 依赖安装 → 配置向导 → UI 启动
+- **🧪 项目专属环境**：`start.bat` 固定使用项目目录下 `.venv`，避免串用其它仓库的 Python 环境
 - **🖱️ 图形化配置向导**：首次运行自动弹出 Tkinter 桌面向导，配置 LLM 模式
 - **🧪 Mock 模式**：无需 Azure 订阅，开箱即可体验完整 4 Agent 流程
 - **🌐 真实 LLM**：支持 Azure OpenAI，企业租户内合规调用
@@ -150,6 +151,18 @@ talentscope/
 6. 观察实时进度条 → 排序表 → 下载报告
 
 预计耗时：**Mock 模式 5 秒；Azure OpenAI 模式 20-40 秒**
+
+---
+
+## 📈 反馈评测
+
+- UI 中的“简历库管理”页已内置试点评测概览，可直接查看反馈覆盖率、正向反馈率、负向反馈率
+- 可下载 `feedback_evaluation.csv`，作为试点阶段的评测留档
+- 也可运行离线脚本生成 Markdown 报告：
+
+```bash
+.venv/Scripts/python.exe scripts/evaluate_feedback.py
+```
 
 ---
 

@@ -204,3 +204,57 @@ def stats() -> dict:
         "by_language": dict(sorted(lang_count.items(), key=lambda x: -x[1])),
         "by_feedback": dict(sorted(feedback_count.items(), key=lambda x: -x[1])),
     }
+
+
+def summarize_feedback() -> dict:
+    recs = list_records()
+    total = len(recs)
+    rows: list[dict] = []
+    positive = {"通过", "录用"}
+    negative = {"淘汰", "面试后不符"}
+    neutral = {"存疑"}
+
+    feedback_total = 0
+    pos_count = 0
+    neg_count = 0
+    neutral_count = 0
+
+    for rec in recs:
+        status = rec.feedback_status or "未反馈"
+        if status != "未反馈":
+            feedback_total += 1
+        if status in positive:
+            pos_count += 1
+        elif status in negative:
+            neg_count += 1
+        elif status in neutral:
+            neutral_count += 1
+
+        rows.append({
+            "ID": rec.id,
+            "姓名": rec.display_name,
+            "部门": rec.department,
+            "反馈状态": status,
+            "反馈说明": rec.feedback_note,
+            "反馈时间": rec.feedback_updated_at,
+            "来源文件": rec.source_file,
+        })
+
+    coverage = round(feedback_total / total * 100, 1) if total else 0.0
+    positive_rate = round(pos_count / feedback_total * 100, 1) if feedback_total else 0.0
+    negative_rate = round(neg_count / feedback_total * 100, 1) if feedback_total else 0.0
+    neutral_rate = round(neutral_count / feedback_total * 100, 1) if feedback_total else 0.0
+
+    return {
+        "total_candidates": total,
+        "feedback_total": feedback_total,
+        "feedback_coverage": coverage,
+        "positive_count": pos_count,
+        "negative_count": neg_count,
+        "neutral_count": neutral_count,
+        "positive_rate": positive_rate,
+        "negative_rate": negative_rate,
+        "neutral_rate": neutral_rate,
+        "status_distribution": stats().get("by_feedback", {}),
+        "records": rows,
+    }
