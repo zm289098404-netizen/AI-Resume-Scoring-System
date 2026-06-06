@@ -13,6 +13,7 @@ SKILLS_PATH = ROOT / "config" / "skills_taxonomy.json"
 LANGUAGES_PATH = ROOT / "config" / "languages.json"
 DEPARTMENTS_PATH = ROOT / "config" / "departments.json"
 MODELS_CATALOG_PATH = ROOT / "config" / "models_catalog.json"
+JOB_TEMPLATES_PATH = ROOT / "config" / "job_templates.json"
 
 _cache: dict[str, Any] = {}
 
@@ -92,6 +93,16 @@ def get_provider(provider_id: str) -> dict | None:
         if p.get("id") == provider_id:
             return p
     return None
+
+
+def get_job_templates() -> dict:
+    if "job_templates" not in _cache:
+        if not JOB_TEMPLATES_PATH.exists():
+            _cache["job_templates"] = {"version": "1.0", "templates": []}
+        else:
+            with open(JOB_TEMPLATES_PATH, "r", encoding="utf-8") as f:
+                _cache["job_templates"] = json.load(f)
+    return _cache["job_templates"]
 
 
 def get_skills_taxonomy() -> dict:

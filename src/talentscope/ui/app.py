@@ -23,7 +23,7 @@ from talentscope.config_loader import (
     get_languages, save_languages,
     get_departments, save_departments,
     save_config, reload_config,
-    get_models_catalog, get_provider,
+    get_models_catalog, get_provider, get_job_templates,
 )
 from talentscope.core import resume_library as lib
 from talentscope.core import llm_client
@@ -137,6 +137,107 @@ def _render_feedback_metrics() -> None:
             width="stretch",
         )
     st.caption("说明：当前评测基于人才库中的人工反馈状态汇总，用于试点阶段观察正向/负向反馈分布与覆盖率。")
+
+
+def _merge_required_languages(
+    base_langs: list[dict],
+    template_langs: list[dict],
+    lang_levels: list[str],
+) -> list[dict]:
+    merged: dict[str, dict] = {}
+    level_idx = {name: i for i, name in enumerate(lang_levels)}
+
+    def _pick_higher(current: str, incoming: str) -> str:
+        if incoming not in level_idx:
+            return current
+        if current not in level_idx:
+            return incoming
+        return incoming if level_idx[incoming] > level_idx[current] else current
+
+    for item in base_langs + template_langs:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        if name not in merged:
+            merged[name] = {"name": name, "min_level": item.get("min_level", "日常")}
+        else:
+            merged[name]["min_level"] = _pick_higher(
+                merged[name].get("min_level", "日常"),
+                item.get("min_level", "日常"),
+            )
+    return list(merged.values())
+
+
+def _render_template_detail(template: dict) -> None:
+    st.markdown("### 📐 模板严谨性说明")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("模板版本", template.get("version", "-") )
+    c2.metric("关键级别", template.get("criticality_level", "-") )
+    c3.metric("经验要求", f"{template.get('experience_years', 0)} 年+")
+
+    st.caption(template.get("business_context", ""))
+    with st.expander("查看职责与硬性要求", expanded=True):
+        st.markdown("**岗位职责**")
+        for item in template.get("responsibilities", []):
+            st.markdown(f"- {item}")
+
+        st.markdown("**硬性要求（含核验证据）**")
+        for req in template.get("hard_requirements", []):
+            st.markdown(f"- 要求：{req.get('requirement', '')}")
+            st.markdown(f"  理由：{req.get('rationale', '')}")
+            st.markdown(f"  证据：{req.get('evidence_hint', '')}")
+
+        if template.get("risk_controls"):
+            st.markdown("**风险控制点**")
+            for item in template.get("risk_controls", []):
+                st.markdown(f"- {item}")
+
+
+def _render_attrition_warning_panel(records: list[lib.LibraryRecord]) -> None:
+    st.markdown("### 🚨 人才流失预警面板")
+    st.caption("当关键岗位/部门的即战力后备人数低于阈值时自动预警。即战力口径：反馈状态为“通过”或“录用”。")
+
+    all_departments = sorted({r.department for r in records if r.department})
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        watch_departments = st.multiselect(
+            "关键岗位所属部门",
+            all_departments,
+            default=all_departments[: min(3, len(all_departments))],
+            key="attrition_watch_departments",
+        )
+    with col2:
+        min_ready = st.number_input("预警阈值（即战力人数）", min_value=1, max_value=20, value=2, step=1)
+
+    if not watch_departments:
+        st.info("请选择至少一个关键部门以启用预警。")
+        return
+
+    rows = []
+    for dept in watch_departments:
+        dept_records = [r for r in records if r.department == dept]
+        total = len(dept_records)
+        ready = sum(1 for r in dept_records if r.feedback_status in {"通过", "录用"})
+        uncertain = sum(1 for r in dept_records if r.feedback_status == "存疑")
+        warning = "✅ 正常" if ready >= min_ready else "⚠️ 预警"
+        rows.append({
+            "部门": dept,
+            "总人数": total,
+            "即战力人数": ready,
+            "存疑人数": uncertain,
+            "阈值": int(min_ready),
+            "状态": warning,
+            "缺口": max(0, int(min_ready) - ready),
+        })
+
+    alert_df = pd.DataFrame(rows).sort_values(["状态", "缺口"], ascending=[False, False])
+    alert_count = int((alert_df["状态"] == "⚠️ 预警").sum())
+    c1, c2 = st.columns(2)
+    c1.metric("预警部门数", alert_count)
+    c2.metric("监控部门数", len(alert_df))
+    st.dataframe(alert_df, width="stretch", hide_index=True)
+    if alert_count > 0:
+        st.error("存在关键岗位后备风险，请优先补充即战力候选人或启动培养计划。")
 
 
 def _render_workflow_guide() -> None:
@@ -382,6 +483,7 @@ try:
     taxonomy = get_skills_taxonomy()
     lang_cfg = get_languages()
     dept_cfg = get_departments()
+    template_cfg = get_job_templates()
 except Exception as e:
     st.error(f"配置加载失败：{e}")
     st.stop()
@@ -389,6 +491,7 @@ except Exception as e:
 LANG_NAMES = [l["name"] for l in lang_cfg["languages"]]
 LANG_LEVELS = lang_cfg.get("levels", ["入门", "日常", "流利", "母语"])
 DEPT_NAMES = [d["name"] for d in dept_cfg["departments"]]
+TEMPLATES = template_cfg.get("templates", [])
 
 # ---------------- 顶部状态条（玻璃卡） ----------------
 c1, c2, c3, c4 = st.columns(4)
@@ -447,20 +550,41 @@ with tab1:
     st.markdown("---")
 
     left, right = st.columns([1, 1])
+    template_required_skills: list[str] = []
+    template_required_languages: list[dict] = []
+    apply_template_constraints = False
 
     with left:
-        st.subheader("① 岗位描述 (JD)")
+        st.subheader("① 岗位模板（严谨版）")
+        template_opts = ["不使用模板"] + [t.get("name", t.get("id", "模板")) for t in TEMPLATES]
+        selected_template_name = st.selectbox("选择岗位模板", template_opts, index=0)
+        selected_template = None
+        if selected_template_name != "不使用模板":
+            selected_template = next((t for t in TEMPLATES if t.get("name") == selected_template_name), None)
+            if selected_template:
+                _render_template_detail(selected_template)
+                if st.button("📥 应用模板JD文本", key="apply_template_jd"):
+                    st.session_state["jd_template_prefill"] = selected_template.get("jd_text", "")
+                    st.rerun()
+                apply_template_constraints = st.checkbox("将模板硬性条件并入评分", value=True)
+                template_required_skills = selected_template.get("must_have_skills", [])
+                template_required_languages = selected_template.get("required_languages", [])
+
+        st.markdown("---")
+        st.subheader("② 岗位描述 (JD)")
         jd_source = st.radio("输入方式", ["✍️ 手动粘贴", "📁 上传示例 JD"], horizontal=True, label_visibility="collapsed")
         if jd_source == "📁 上传示例 JD":
             sample_jd_path = get_root() / "data" / "samples" / "sample_jd.txt"
             default_jd = sample_jd_path.read_text(encoding="utf-8") if sample_jd_path.exists() else ""
         else:
             default_jd = ""
+        if "jd_template_prefill" in st.session_state:
+            default_jd = st.session_state.pop("jd_template_prefill")
         jd_text = st.text_area("JD 内容", value=default_jd, height=220,
                                 placeholder="例如：招聘高级 Python 后端工程师，5 年以上经验...",
                                 label_visibility="collapsed")
 
-        st.subheader("② 必备技能（多选）")
+        st.subheader("③ 必备技能（多选）")
         selected_skills: list[str] = []
         categories = taxonomy["categories"]
         cat_names = list(categories.keys())
@@ -475,8 +599,10 @@ with tab1:
                             selected_skills.append(sk)
         if selected_skills:
             st.success(f"✅ 已选 {len(selected_skills)} 项必备技能")
+        if apply_template_constraints and template_required_skills:
+            st.info(f"模板追加必备技能：{', '.join(template_required_skills)}")
 
-        st.subheader("③ 语言要求（多选）")
+        st.subheader("④ 语言要求（多选）")
         st.caption("勾选岗位需要的语言并选择最低等级。")
         required_languages: list[dict] = []
         lcols = st.columns(2)
@@ -490,9 +616,12 @@ with tab1:
                                        label_visibility="collapsed", disabled=not chk)
                 if chk:
                     required_languages.append({"name": lname, "min_level": lvl})
+        if apply_template_constraints and template_required_languages:
+            tips = [f"{x.get('name', '')}({x.get('min_level', '')})" for x in template_required_languages]
+            st.info(f"模板追加语言要求：{', '.join(tips)}")
 
     with right:
-        st.subheader("④ 简历来源")
+        st.subheader("⑤ 简历来源")
         src = st.radio("选择来源", ["📤 临时上传", "🗂️ 从简历库选人"], horizontal=True)
 
         uploaded_files = []
@@ -529,7 +658,7 @@ with tab1:
                                      list(opts.keys()), default=list(opts.keys()))
                 picked_records = [opts[s] for s in sel]
 
-        st.subheader("⑤ 评分参数")
+        st.subheader("⑥ 评分参数")
         threshold = st.slider("通过门槛分数", 0, 100, cfg["scoring"].get("min_score_threshold", 60))
         top_n = st.slider("展示 Top N", 1, 50, 10)
         vacancy_target = st.slider("岗位补位目标人数", 1, 10, 3)
@@ -551,12 +680,18 @@ with tab1:
             status.info(msg)
 
         with st.spinner("AI 团队工作中..."):
+            merged_skills = selected_skills[:]
+            merged_langs = required_languages[:]
+            if apply_template_constraints and selected_template:
+                merged_skills = sorted(set(merged_skills + template_required_skills))
+                merged_langs = _merge_required_languages(merged_langs, template_required_languages, LANG_LEVELS)
+
             if src == "🗂️ 从简历库选人":
                 result = run_from_library(
                     jd_text=jd_text,
                     records=picked_records,
-                    required_skill_filter=selected_skills or None,
-                    required_languages=required_languages or None,
+                    required_skill_filter=merged_skills or None,
+                    required_languages=merged_langs or None,
                     progress_cb=_cb,
                 )
             else:
@@ -567,8 +702,8 @@ with tab1:
                     resume_inputs = sample_resumes
                 result = run_pipeline(
                     jd_text=jd_text, resumes=resume_inputs,
-                    required_skill_filter=selected_skills or None,
-                    required_languages=required_languages or None,
+                    required_skill_filter=merged_skills or None,
+                    required_languages=merged_langs or None,
                     progress_cb=_cb,
                 )
 
@@ -695,6 +830,7 @@ with tab2:
             st.bar_chart(pd.Series(stats1["by_feedback"]))
 
     _render_feedback_metrics()
+    _render_attrition_warning_panel(lib.list_records())
 
     fcol1, fcol2, fcol3, fcol4 = st.columns(4)
     with fcol1:

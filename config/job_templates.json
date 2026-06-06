@@ -1,0 +1,211 @@
+{
+  "version": "1.0",
+  "templates": [
+    {
+      "id": "backend-java-v1",
+      "version": "2026.06",
+      "name": "Java后端工程师（核心交付）",
+      "role_family": "研发",
+      "criticality_level": "高",
+      "business_context": "支撑核心业务系统稳定交付，保障需求迭代与故障快速恢复。",
+      "experience_years": 5,
+      "education": "本科及以上",
+      "must_have_skills": [
+        "Java",
+        "Spring Boot",
+        "MySQL",
+        "Redis",
+        "Docker",
+        "Kubernetes"
+      ],
+      "required_languages": [
+        {
+          "name": "中文",
+          "min_level": "流利",
+          "business_impact": "保障跨团队需求沟通与问题闭环效率"
+        }
+      ],
+      "responsibilities": [
+        "负责核心服务设计、开发、上线与稳定性优化",
+        "推进接口规范、日志规范、异常治理和容量评估",
+        "在跨团队协作中保障交付质量与计划可控"
+      ],
+      "hard_requirements": [
+        {
+          "requirement": "至少2个高并发业务场景的架构或核心模块经验",
+          "rationale": "确保在业务增长阶段具备稳定性设计能力",
+          "evidence_hint": "请提供吞吐量、时延、可用性等量化指标"
+        },
+        {
+          "requirement": "具备容器化部署和故障排查能力",
+          "rationale": "缩短发布窗口与故障恢复时间",
+          "evidence_hint": "请说明一次线上故障定位与恢复过程"
+        }
+      ],
+      "preferred_requirements": [
+        "有云上托管服务经验（如监控、网关、消息中间件）",
+        "有性能压测与容量治理经验"
+      ],
+      "risk_controls": [
+        "核验候选人是否具备真实线上问题处置经验，避免只停留在开发环节",
+        "核验项目贡献边界，防止团队成果被误认为个人主导"
+      ],
+      "interview_focus": [
+        "高并发场景设计与取舍",
+        "故障复盘能力",
+        "跨团队沟通和推进能力"
+      ],
+      "jd_text": "招聘Java后端工程师，5年以上经验，本科及以上。必须掌握Java、Spring Boot、MySQL、Redis、Docker、Kubernetes，能够独立承担核心服务设计开发与线上稳定性保障。具备高并发场景优化和容器化运维协同经验，能够跨团队推进需求落地并完成故障闭环。"
+    },
+    {
+      "id": "qa-automation-v1",
+      "version": "2026.06",
+      "name": "测试开发工程师（自动化质量保障）",
+      "role_family": "测试",
+      "criticality_level": "中高",
+      "business_context": "保障多版本并行迭代下的回归效率与发布质量。",
+      "experience_years": 3,
+      "education": "本科及以上",
+      "must_have_skills": [
+        "Python",
+        "Selenium",
+        "API测试",
+        "自动化测试",
+        "CI/CD"
+      ],
+      "required_languages": [
+        {
+          "name": "中文",
+          "min_level": "流利",
+          "business_impact": "确保与研发、产品协同明确质量边界"
+        }
+      ],
+      "responsibilities": [
+        "建设并维护自动化测试框架",
+        "制定回归策略并优化测试覆盖率",
+        "参与缺陷根因分析与质量改进闭环"
+      ],
+      "hard_requirements": [
+        {
+          "requirement": "可独立搭建接口与UI自动化链路",
+          "rationale": "提升回归效率并减少人工漏测",
+          "evidence_hint": "请说明自动化覆盖率和回归耗时改善幅度"
+        }
+      ],
+      "preferred_requirements": [
+        "有性能测试或稳定性测试经验",
+        "有质量平台建设经验"
+      ],
+      "risk_controls": [
+        "核验自动化脚本是否长期稳定运行，而非一次性搭建",
+        "核验质量指标是否可量化并可复盘"
+      ],
+      "interview_focus": [
+        "自动化框架设计能力",
+        "缺陷分析深度",
+        "质量与效率平衡能力"
+      ],
+      "jd_text": "招聘测试开发工程师，3年以上经验，本科及以上。必须掌握Python、Selenium、API测试和CI/CD流程，能够独立建设自动化测试体系并持续优化覆盖率和回归效率。需要与研发和产品高效协同，推动质量问题闭环。"
+    },
+    {
+      "id": "data-analyst-v1",
+      "version": "2026.06",
+      "name": "数据分析师（经营洞察）",
+      "role_family": "数据",
+      "criticality_level": "中",
+      "business_context": "为业务决策提供可解释、可追踪的数据洞察。",
+      "experience_years": 3,
+      "education": "本科及以上",
+      "must_have_skills": [
+        "SQL",
+        "Python",
+        "数据分析",
+        "可视化",
+        "统计学"
+      ],
+      "required_languages": [
+        {
+          "name": "中文",
+          "min_level": "流利",
+          "business_impact": "支撑经营复盘与管理层沟通"
+        }
+      ],
+      "responsibilities": [
+        "构建经营分析指标体系",
+        "输出周/月度业务分析报告",
+        "为关键业务问题提供归因与建议"
+      ],
+      "hard_requirements": [
+        {
+          "requirement": "熟练编写复杂SQL并可做数据清洗建模",
+          "rationale": "确保分析结果可靠且可复现",
+          "evidence_hint": "请给出一个从数据抽取到结论输出的完整案例"
+        }
+      ],
+      "preferred_requirements": [
+        "有AB实验分析经验",
+        "有经营指标看板建设经验"
+      ],
+      "risk_controls": [
+        "核验候选人是否真正理解业务，不只会报表制作",
+        "核验结论是否具备可执行性和复盘机制"
+      ],
+      "interview_focus": [
+        "问题定义与指标拆解能力",
+        "分析结论可信度",
+        "跨部门推动能力"
+      ],
+      "jd_text": "招聘数据分析师，3年以上经验，本科及以上。必须掌握SQL、Python、统计分析和可视化，能够独立完成指标体系建设、经营分析与结论复盘，输出可执行的数据建议并支撑跨部门协作。"
+    },
+    {
+      "id": "ops-sre-v1",
+      "version": "2026.06",
+      "name": "运维工程师（SRE方向）",
+      "role_family": "运维",
+      "criticality_level": "高",
+      "business_context": "保障关键系统可用性与业务连续性，降低生产事故风险。",
+      "experience_years": 4,
+      "education": "本科及以上",
+      "must_have_skills": [
+        "Linux",
+        "Shell",
+        "Docker",
+        "Kubernetes",
+        "监控告警"
+      ],
+      "required_languages": [
+        {
+          "name": "中文",
+          "min_level": "流利",
+          "business_impact": "保障故障响应和跨团队协同效率"
+        }
+      ],
+      "responsibilities": [
+        "负责系统发布、监控、告警与故障响应",
+        "建立容量规划和SLA治理机制",
+        "推动自动化运维和标准化流程落地"
+      ],
+      "hard_requirements": [
+        {
+          "requirement": "具备生产故障处置与复盘经验",
+          "rationale": "保障故障响应效率和稳定性改进闭环",
+          "evidence_hint": "请描述一次P1故障的定位、处置和复盘结论"
+        }
+      ],
+      "preferred_requirements": [
+        "有基础设施即代码实践经验",
+        "有多集群或多环境治理经验"
+      ],
+      "risk_controls": [
+        "核验故障处理是否有明确量化改进结果",
+        "核验自动化能力是否可持续维护"
+      ],
+      "interview_focus": [
+        "故障响应与应急能力",
+        "可观测性体系理解",
+        "自动化与平台化思维"
+      ],
+      "jd_text": "招聘运维工程师（SRE方向），4年以上经验，本科及以上。必须掌握Linux、Shell、Docker、Kubernetes和监控告警体系，能够承担生产发布、故障响应、容量规划与稳定性优化工作，保障关键系统业务连续性。"
+    }
+  ]
+}
