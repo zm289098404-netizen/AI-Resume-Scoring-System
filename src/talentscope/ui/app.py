@@ -29,6 +29,93 @@ from talentscope.core import resume_library as lib
 from talentscope.core import llm_client
 from talentscope.pipeline import ResumeInput, run as run_pipeline, run_from_library
 
+FEEDBACK_OPTIONS = ["未反馈", "通过", "存疑", "淘汰", "录用", "面试后不符"]
+
+
+def _fmt_lang(x, key="level"):
+    if isinstance(x, dict):
+        return f'{x.get("name", "?")}({x.get(key, "")})'
+    return str(x)
+
+
+def _status_label(score: float, threshold: int) -> str:
+    if score >= threshold:
+        return "🟢 推荐"
+    if score >= threshold - 15:
+        return "🟡 备选"
+    return "🔴 不推荐"
+
+
+def _render_result_details(candidates: list[dict], threshold: int) -> None:
+    valid_candidates = [c for c in candidates if "error" not in c]
+    if not valid_candidates:
+        return
+
+    st.markdown("### 🧾 评分证据与面试辅助")
+    for idx, candidate in enumerate(
+        sorted(valid_candidates, key=lambda item: item["match"]["total_score"], reverse=True)[:5],
+        1,
+    ):
+        match = candidate["match"]
+        resume = candidate["resume"]
+        title = f"Top {idx} · {candidate['file']} · {match['total_score']} 分 · {_status_label(match['total_score'], threshold)}"
+        with st.expander(title, expanded=(idx == 1)):
+            c1, c2, c3 = st.columns([1.15, 1, 1])
+            with c1:
+                st.markdown("**评分证据**")
+                for item in match.get("evidence_summary", []):
+                    st.markdown(f"- {item}")
+                evidence = match.get("evidence", {})
+                if evidence:
+                    st.caption(
+                        f"置信度 {match.get('confidence', '—')} · 亮点证据 {len(evidence.get('highlight_evidence', []))} 条"
+                    )
+                if match.get("recommendation"):
+                    st.info(match["recommendation"])
+            with c2:
+                st.markdown("**建议核验项**")
+                for item in match.get("follow_up_checks", []):
+                    st.markdown(f"- {item}")
+                if match.get("risks"):
+                    st.markdown("**风险提示**")
+                    for item in match.get("risks", []):
+                        st.markdown(f"- {item}")
+            with c3:
+                st.markdown("**建议追问**")
+                for question in match.get("interview_questions", []):
+                    st.markdown(f"- {question}")
+                if resume.get("highlights"):
+                    st.markdown("**简历亮点**")
+                    for item in resume.get("highlights", [])[:3]:
+                        st.markdown(f"- {item}")
+
+
+def _render_governance_panel() -> None:
+    st.markdown("### 🛡️ 评测与治理")
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown(
+            """
+            **决策原则**
+
+            - 评分仅作为招聘辅助，不替代人工录用决策
+            - 分数由本地规则稳定计算，便于复核与复现
+            - 推荐理由、追问建议由模型生成，但必须结合证据核验
+            - 优先关注岗位相关能力，不以非岗位因素做正向加分
+            """
+        )
+    with g2:
+        st.markdown(
+            """
+            **上线前检查**
+
+            - 先用试点样本校准岗位模板和门槛分数
+            - 对通过/淘汰结果保留人工反馈，形成评测集
+            - 对缺失技能、语言和经验缺口做面试复核
+            - 生产环境建议启用专属租户、网络隔离和日志审计
+            """
+        )
+
 
 # ---------------- 页面配置 ----------------
 st.set_page_config(
@@ -404,18 +491,13 @@ with tab1:
             m = c["match"]
             d = m["dimensions"]
 
-            def _fmt_lang(x, key="level"):
-                # 兼容 dict（{"name":..,"level":..}）和已格式化的字符串
-                if isinstance(x, dict):
-                    return f'{x.get("name","?")}({x.get(key,"")})'
-                return str(x)
-
             matched_l = ", ".join(_fmt_lang(x, "level") for x in m.get("matched_languages", []))
             missing_l = ", ".join(_fmt_lang(x, "min_level") for x in m.get("missing_languages", []))
             rows.append({
                 "姓名": c["file"],
                 "部门": c.get("department", "—"),
                 "总分": m["total_score"],
+                "置信度": m.get("confidence", 0),
                 "硬技能": d.get("hard_skill", 0),
                 "经验": d.get("experience", 0),
                 "语言": d.get("language", 0),
@@ -428,9 +510,7 @@ with tab1:
                 "推荐理由": m.get("recommendation", ""),
             })
         df = pd.DataFrame(rows).sort_values("总分", ascending=False).head(top_n).reset_index(drop=True)
-        df["状态"] = df["总分"].apply(
-            lambda s: "🟢 推荐" if s >= threshold else "🟡 备选" if s >= threshold - 15 else "🔴 不推荐"
-        )
+        df["状态"] = df["总分"].apply(lambda s: _status_label(s, threshold))
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("候选人总数", len(result.candidates))
@@ -455,6 +535,7 @@ with tab1:
             st.markdown(result.report_md)
         with st.expander("🔍 查看 JD 解析结果"):
             st.json(result.jd)
+        _render_result_details(result.candidates, threshold)
 
 
 # ===================================================================
@@ -496,10 +577,11 @@ with tab2:
     st.subheader("📚 当前简历库")
 
     stats1 = lib.stats()
-    s1, s2, s3 = st.columns(3)
+    s1, s2, s3, s4 = st.columns(4)
     s1.metric("总人数", stats1["total"])
     s2.metric("覆盖部门数", len(stats1["by_department"]))
     s3.metric("覆盖语言数", len(stats1["by_language"]))
+    s4.metric("已反馈人数", stats1.get("by_feedback", {}).get("未反馈", 0) and stats1["total"] - stats1.get("by_feedback", {}).get("未反馈", 0) or 0)
 
     if stats1["by_department"]:
         with st.expander("📊 按部门分布"):
@@ -507,16 +589,24 @@ with tab2:
     if stats1["by_language"]:
         with st.expander("🌐 按语言分布"):
             st.bar_chart(pd.Series(stats1["by_language"]))
+    if stats1.get("by_feedback"):
+        with st.expander("🗳️ 反馈状态分布"):
+            st.bar_chart(pd.Series(stats1["by_feedback"]))
 
-    fcol1, fcol2, fcol3 = st.columns(3)
+    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
     with fcol1:
         f_dept = st.multiselect("筛选部门", DEPT_NAMES, key="f_dept")
     with fcol2:
         f_lang = st.multiselect("必须包含语言", LANG_NAMES, key="f_lang")
     with fcol3:
         f_kw = st.text_input("关键字", "", key="f_kw")
+    with fcol4:
+        f_feedback = st.multiselect("反馈状态", FEEDBACK_OPTIONS, key="f_feedback")
 
     records = lib.filter_records(f_dept or None, f_lang or None, f_kw)
+    if f_feedback:
+        feedback_set = set(f_feedback)
+        records = [r for r in records if r.feedback_status in feedback_set]
 
     if not records:
         st.info("当前条件下无记录。")
@@ -529,6 +619,8 @@ with tab2:
                 "部门": r.department,
                 "语言": ", ".join(f'{l["name"]}({l.get("level","")})' for l in r.languages),
                 "技能数": len(r.parsed.get("hard_skills", [])),
+                "反馈状态": r.feedback_status,
+                "反馈时间": r.feedback_updated_at or "—",
                 "导入时间": r.imported_at,
                 "来源文件": r.source_file,
             })
@@ -562,6 +654,34 @@ with tab2:
 
             with st.expander("🔍 查看解析详情"):
                 st.json(rec.parsed)
+
+            st.markdown("#### 🗳️ 人工反馈闭环")
+            fb1, fb2 = st.columns([1, 1.5])
+            with fb1:
+                current_idx = FEEDBACK_OPTIONS.index(rec.feedback_status) if rec.feedback_status in FEEDBACK_OPTIONS else 0
+                feedback_status = st.selectbox(
+                    "反馈结论",
+                    FEEDBACK_OPTIONS,
+                    index=current_idx,
+                    key=f"fb_status_{rec.id}",
+                )
+                st.caption(f"最近更新时间：{rec.feedback_updated_at or '暂无'}")
+            with fb2:
+                feedback_note = st.text_area(
+                    "反馈说明",
+                    rec.feedback_note,
+                    key=f"fb_note_{rec.id}",
+                    height=110,
+                    placeholder="例如：面试通过，项目深度符合预期；或：关键词匹配高，但实操深度不足。",
+                )
+            if st.button("💾 保存反馈", key=f"fb_save_{rec.id}", width="stretch"):
+                lib.update_feedback(rec.id, feedback_status, feedback_note)
+                st.success("反馈已保存，可用于后续试点评测和规则校准。")
+                st.rerun()
+
+            if rec.feedback_history:
+                with st.expander("🕘 查看反馈历史"):
+                    st.dataframe(pd.DataFrame(rec.feedback_history[::-1]), width="stretch", hide_index=True)
 
 
 # ===================================================================
@@ -868,6 +988,9 @@ with tab3:
                 st.rerun()
         else:
             st.caption("（暂无自定义部门）")
+
+    st.markdown("---")
+    _render_governance_panel()
 
 
 # ---------------- 侧边栏 ----------------

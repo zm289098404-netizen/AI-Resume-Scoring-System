@@ -47,14 +47,21 @@ def build_report(jd: dict, results: list[dict], output_path: Path | None = None)
         lines.append(f"\n### 🏅 第 {i} 名 · {res.get('candidate_id')}（总分 {m['total_score']}）")
         lines.append(f"- **文件**：{r['file']}")
         lines.append(f"- **经验**：{res.get('experience_years', 0)} 年　·　**学历**：{res.get('education', '—')}")
+        lines.append(f"- **置信度**：{m.get('confidence', '—')}")
         if m.get("matched_skills"):
             lines.append(f"- ✅ **匹配技能**：{', '.join(m['matched_skills'])}")
         if m.get("missing_skills"):
             lines.append(f"- ❌ **缺失技能**：{', '.join(m['missing_skills'])}")
+        if m.get("evidence_summary"):
+            lines.append(f"- 🧾 **评分证据**：{'；'.join(m['evidence_summary'])}")
         if res.get("highlights"):
             lines.append(f"- 🌟 **亮点**：{'；'.join(res['highlights'])}")
         if m.get("risks"):
             lines.append(f"- ⚠️ **风险**：{'；'.join(m['risks'])}")
+        if m.get("follow_up_checks"):
+            lines.append(f"- 🔎 **核验建议**：{'；'.join(m['follow_up_checks'])}")
+        if m.get("interview_questions"):
+            lines.append(f"- 🎤 **建议追问**：{'；'.join(m['interview_questions'])}")
         lines.append(f"- 💡 **推荐理由**：{m.get('recommendation', '—')}")
 
     lines.append(f"\n---")

@@ -32,6 +32,10 @@ class LibraryRecord:
     languages: list[dict] = field(default_factory=list)  # [{"name":..,"level":..}]
     tags: list[str] = field(default_factory=list)
     notes: str = ""
+    feedback_status: str = "未反馈"
+    feedback_note: str = ""
+    feedback_updated_at: str = ""
+    feedback_history: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -48,6 +52,10 @@ class LibraryRecord:
             languages=d.get("languages", []),
             tags=d.get("tags", []),
             notes=d.get("notes", ""),
+            feedback_status=d.get("feedback_status", "未反馈"),
+            feedback_note=d.get("feedback_note", ""),
+            feedback_updated_at=d.get("feedback_updated_at", ""),
+            feedback_history=d.get("feedback_history", []),
         )
 
 
@@ -96,6 +104,24 @@ def update_record(record_id: str, **fields) -> LibraryRecord | None:
     for k, v in fields.items():
         if hasattr(rec, k):
             setattr(rec, k, v)
+    save_record(rec)
+    return rec
+
+
+def update_feedback(record_id: str, status: str, note: str = "") -> LibraryRecord | None:
+    rec = get_record(record_id)
+    if rec is None:
+        return None
+
+    now = datetime.now().isoformat(timespec="seconds")
+    rec.feedback_status = status
+    rec.feedback_note = note
+    rec.feedback_updated_at = now
+    rec.feedback_history.append({
+        "status": status,
+        "note": note,
+        "updated_at": now,
+    })
     save_record(rec)
     return rec
 
@@ -155,6 +181,8 @@ def filter_records(
             r for r in recs
             if kw in r.display_name.lower()
             or kw in r.department.lower()
+            or kw in r.notes.lower()
+            or kw in r.feedback_note.lower()
             or kw in json.dumps(r.parsed, ensure_ascii=False).lower()
         ]
     return recs
@@ -164,12 +192,15 @@ def stats() -> dict:
     recs = list_records()
     dept_count: dict[str, int] = {}
     lang_count: dict[str, int] = {}
+    feedback_count: dict[str, int] = {}
     for r in recs:
         dept_count[r.department] = dept_count.get(r.department, 0) + 1
+        feedback_count[r.feedback_status] = feedback_count.get(r.feedback_status, 0) + 1
         for lng in r.languages:
             lang_count[lng["name"]] = lang_count.get(lng["name"], 0) + 1
     return {
         "total": len(recs),
         "by_department": dict(sorted(dept_count.items(), key=lambda x: -x[1])),
         "by_language": dict(sorted(lang_count.items(), key=lambda x: -x[1])),
+        "by_feedback": dict(sorted(feedback_count.items(), key=lambda x: -x[1])),
     }
