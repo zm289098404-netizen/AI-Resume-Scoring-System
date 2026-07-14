@@ -20,6 +20,7 @@ from talentscope.config_loader import get_config
 from talentscope.core.language_detector import score_languages
 from talentscope.core.llm_client import get_llm_client
 from talentscope.core.stability_framework import (
+    FairnessChecker,
     MatchResultValidator,
     safe_json_loads,
 )
@@ -113,7 +114,15 @@ def match(jd: dict, resume: dict) -> dict:
         fixed_result.get("matched_skills", []),
         jd.get("hard_skills", [])
     )
-    
+
+    # ✅ 公平性检查（扫描推荐理由是否含受保护属性词汇）
+    fairness = FairnessChecker.check(fixed_result)
+    fixed_result["_fairness"] = fairness
+    if fairness["needs_human_review"]:
+        fixed_result.setdefault("risks", []).append(
+            f"建议人工复核：{fairness['review_reason']}"
+        )
+
     return fixed_result
 
 

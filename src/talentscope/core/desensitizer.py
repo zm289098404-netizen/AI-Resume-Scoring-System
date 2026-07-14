@@ -39,11 +39,46 @@ ADDRESS = re.compile(
 # 生日（YYYY-MM-DD / YYYY年MM月DD日）
 BIRTHDAY = re.compile(r"(?:19|20)\d{2}[-/年](?:0?[1-9]|1[0-2])[-/月](?:0?[1-9]|[12]\d|3[01])日?")
 
+# ── 公平性保护属性 ──────────────────────────────────────────────────────────
+
+# 性别（明确标签场景：「性别: 男」「Gender: Female」）
+GENDER_LABEL = re.compile(
+    r"((?:性别|Gender|gender)[\s::：]\s*)(男|女|Male|Female|male|female|先生|女士|Mr\.|Ms\.|Mrs\.)"
+)
+# 行文中的性别代词（他/她/他的/她的/Mr/Ms 等）
+GENDER_PRONOUN = re.compile(
+    r"\b(他|她|他的|她的|先生|女士|Mr\.|Ms\.|Mrs\.|Mr |Ms |Mrs )(?=[\u4e00-\u9fa5A-Za-z])"
+)
+
+# 年龄（「年龄: 28岁」「28 years old」「Age: 28」）
+AGE_LABEL = re.compile(
+    r"((?:年龄|Age|age)[\s::：]\s*)(\d{1,2}\s*(?:岁|years?\s*old|y\.?o\.?))"
+)
+# 出生年份（「出生于 1990」「Born in 1992」）
+BIRTH_YEAR = re.compile(
+    r"((?:出生于|出生年份|Born in|birth year)[\s::：]?\s*)((?:19|20)\d{2})"
+)
+
+# 籍贯/民族（「籍贯: 湖南」「民族: 汉族」）
+NATIVE_PLACE = re.compile(
+    r"((?:籍贯|民族|Ethnicity|ethnicity|Nationality|nationality|Origin)[\s::：]\s*)([\u4e00-\u9fa5A-Za-z]{2,10})"
+)
+
+# 政治面貌（「政治面貌: 党员」）
+POLITICAL = re.compile(
+    r"((?:政治面貌|党派|Political)[\s::：]\s*)([\u4e00-\u9fa5A-Za-z]{2,10})"
+)
+
+# 婚姻状况（「婚姻状况: 已婚」）
+MARITAL = re.compile(
+    r"((?:婚姻状况|婚否|Marital)[\s::：]\s*)([\u4e00-\u9fa5A-Za-z]{2,6})"
+)
+
 
 @dataclass
 class Desensitizer:
     enabled: bool = True
-    fields: list[str] = field(default_factory=lambda: ["name", "phone", "email", "id_card", "address"])
+    fields: list[str] = field(default_factory=lambda: ["name", "phone", "email", "id_card", "address", "gender", "age", "native_place"])
     _map: dict[str, str] = field(default_factory=dict)  # placeholder -> original
     _reverse: dict[str, str] = field(default_factory=dict)  # original -> placeholder
 
@@ -77,6 +112,17 @@ class Desensitizer:
             text = ADDRESS.sub(lambda m: self._replace(m.group(0), "ADDR"), text)
         if "birthday" in self.fields:
             text = BIRTHDAY.sub(lambda m: self._replace(m.group(0), "BDAY"), text)
+        # ── 公平性保护属性脱敏 ────────────────────────────────────────────────
+        if "gender" in self.fields:
+            text = GENDER_LABEL.sub(lambda m: m.group(1) + self._replace(m.group(2), "GENDER"), text)
+            text = GENDER_PRONOUN.sub(lambda m: self._replace(m.group(1), "PRONOUN"), text)
+        if "age" in self.fields:
+            text = AGE_LABEL.sub(lambda m: m.group(1) + self._replace(m.group(2), "AGE"), text)
+            text = BIRTH_YEAR.sub(lambda m: m.group(1) + self._replace(m.group(2), "BIRTHYR"), text)
+        if "native_place" in self.fields:
+            text = NATIVE_PLACE.sub(lambda m: m.group(1) + self._replace(m.group(2), "ORIGIN"), text)
+            text = POLITICAL.sub(lambda m: m.group(1) + self._replace(m.group(2), "POLITICAL"), text)
+            text = MARITAL.sub(lambda m: m.group(1) + self._replace(m.group(2), "MARITAL"), text)
         return text
 
     def restore(self, text: str) -> str:

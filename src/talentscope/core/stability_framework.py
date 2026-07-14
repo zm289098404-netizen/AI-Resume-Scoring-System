@@ -459,3 +459,151 @@ class ExceptionTracker:
             for log in ExceptionTracker._logs:
                 f.write(json.dumps(log, ensure_ascii=False) + '\n')
         logger.info(f"异常日志已导出到 {filepath}")
+
+
+# ============================================================================
+# Layer 4: 公平性检查（FairnessChecker）
+# 检测 LLM 推荐理由中是否包含与受保护属性相关的偏见词汇，
+# 并对边缘分值区间的候选人标记人工复核。
+# ============================================================================
+
+class FairnessChecker:
+    """
+    公平性检查器：防止 AI 评分结果受性别/年龄/籍贯/婚姻状况等
+    受保护属性影响，确保评分仅基于岗位相关能力。
+
+    用法：
+        report = FairnessChecker.check(match_result)
+        if report["needs_human_review"]:
+            ...
+    """
+
+    # 受保护属性关键词（出现在 recommendation / risks 中即触发警告）
+    _BIAS_PATTERNS: dict[str, list[str]] = {
+        "gender":   ["男性", "女性", "男生", "女生", "先生", "女士", "他", "她",
+                     "male", "female", "mr.", "ms.", "mother", "father",
+                     "pregnancy", "育儿", "生育", "哺乳"],
+        "age":      ["年龄", "岁", "老", "老化", "年轻", "应届", "老员工",
+                     "age", "too old", "too young", "experienced age"],
+        "origin":   ["籍贯", "户籍", "老家", "农村", "外地", "本地",
+                     "ethnicity", "nationality", "origin"],
+        "marital":  ["婚姻", "已婚", "未婚", "离异", "有孩子", "孩子",
+                     "marital", "married", "single", "children"],
+        "politics": ["党员", "团员", "政治面貌", "political"],
+    }
+
+    # 人工复核分值边界（总分落在此区间需复核）
+    _REVIEW_SCORE_RANGE = (55, 75)
+
+    @classmethod
+    def check(cls, match_result: dict, filename: str = "") -> dict:
+        """
+        对单份匹配结果进行公平性扫描。
+
+        Returns:
+            {
+                "passed": bool,                   # True = 无偏见词
+                "needs_human_review": bool,        # True = 建议人工复核
+                "triggered_categories": list[str], # 触发的偏见类别
+                "triggered_snippets": list[str],   # 触发的具体片段
+                "review_reason": str,              # 复核原因说明
+                "score": float,                    # 原始总分
+            }
+        """
+        triggered_categories: list[str] = []
+        triggered_snippets:   list[str] = []
+
+        # 拼接待扫描文本（推荐理由 + 风险点）
+        scan_text = " ".join([
+            str(match_result.get("recommendation", "")),
+            " ".join(str(r) for r in match_result.get("risks", [])),
+            " ".join(str(q) for q in match_result.get("interview_questions", [])),
+        ]).lower()
+
+        for category, keywords in cls._BIAS_PATTERNS.items():
+            for kw in keywords:
+                if kw.lower() in scan_text:
+                    if category not in triggered_categories:
+                        triggered_categories.append(category)
+                    # 提取上下文片段（前后 15 个字符）
+                    idx = scan_text.find(kw.lower())
+                    snippet = scan_text[max(0, idx - 15): idx + len(kw) + 15].strip()
+                    triggered_snippets.append(f"[{category}] ...{snippet}...")
+
+        score = float(match_result.get("total_score", 0))
+        low, high = cls._REVIEW_SCORE_RANGE
+        in_borderline = low <= score <= high
+
+        reasons: list[str] = []
+        if triggered_categories:
+            reasons.append(f"推荐理由含受保护属性词汇：{', '.join(triggered_categories)}")
+        if in_borderline:
+            reasons.append(f"总分 {score:.1f} 处于边缘区间（{low}–{high}），建议人工复核避免边界歧视")
+
+        needs_review = bool(triggered_categories) or in_borderline
+        passed       = not bool(triggered_categories)
+
+        report = {
+            "passed":               passed,
+            "needs_human_review":   needs_review,
+            "triggered_categories": triggered_categories,
+            "triggered_snippets":   triggered_snippets,
+            "review_reason":        "；".join(reasons) if reasons else "无异常",
+            "score":                score,
+            "filename":             filename,
+        }
+
+        if not passed:
+            logger.warning(
+                f"[FairnessChecker] {filename or 'unknown'} 触发偏见词警告: "
+                f"{triggered_categories} | 片段: {triggered_snippets[:2]}"
+            )
+
+        return report
+
+    @classmethod
+    def batch_summary(cls, fairness_reports: list[dict]) -> dict:
+        """
+        汇总批量公平性报告，供管理员审查。
+
+        Returns:
+            {
+                "total": int,
+                "passed": int,
+                "needs_review": int,
+                "bias_category_counts": dict,   # 各类偏见触发次数
+                "review_candidates": list[str],  # 需复核的文件名
+                "score_distribution": dict,      # 分段统计
+            }
+        """
+        total   = len(fairness_reports)
+        passed  = sum(1 for r in fairness_reports if r["passed"])
+        reviews = [r for r in fairness_reports if r["needs_human_review"]]
+
+        category_counts: dict[str, int] = {}
+        for r in fairness_reports:
+            for cat in r.get("triggered_categories", []):
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+
+        # 分数段分布
+        buckets = {"0-59": 0, "60-74": 0, "75-89": 0, "90-100": 0}
+        for r in fairness_reports:
+            s = r.get("score", 0)
+            if s < 60:
+                buckets["0-59"] += 1
+            elif s < 75:
+                buckets["60-74"] += 1
+            elif s < 90:
+                buckets["75-89"] += 1
+            else:
+                buckets["90-100"] += 1
+
+        return {
+            "total":                total,
+            "passed":               passed,
+            "needs_review":         len(reviews),
+            "pass_rate":            round(passed / total * 100, 1) if total else 0,
+            "bias_category_counts": category_counts,
+            "review_candidates":    [r["filename"] for r in reviews],
+            "score_distribution":   buckets,
+        }
