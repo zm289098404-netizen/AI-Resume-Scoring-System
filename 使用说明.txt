@@ -1,0 +1,10 @@
+TalentScope 离线独立运行说明
+
+1. 双击文件：启动TalentScope.bat
+2. 系统会自动在浏览器打开：http://localhost:8501
+3. 功能与原项目网页一致。
+4. 关闭“启动TalentScope.bat”窗口即可停止系统。
+
+注意：
+- 请保持本文件夹结构完整，不要删除 .venv、src、config、data 等目录。
+- 本离线包已包含运行环境，无需额外安装 Python 或联网拉取依赖。

@@ -1,0 +1,1850 @@
+"""
+TalentScope Streamlit 控制台
+============================
+3 个 Tab：
+  ① JD 匹配评分（支持「上传」或「从简历库选人」两种来源）
+  ② 简历库管理（批量导入 / 按部门-语言筛选 / 编辑 / 删除）
+  ③ 语言与部门管理（管理员 DIY，可扩展任意小语种 / 部门）
+"""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "src"))
+
+import pandas as pd
+import streamlit as st
+
+from talentscope.config_loader import (
+    get_config, get_root, get_skills_taxonomy,
+    get_languages, save_languages,
+    get_departments, save_departments,
+    save_config, reload_config,
+    get_models_catalog, get_provider, get_job_templates,
+)
+from talentscope.core import resume_library as lib
+from talentscope.core import llm_client
+from talentscope.pipeline import ResumeInput, run as run_pipeline, run_from_library
+
+FEEDBACK_OPTIONS = ["未反馈", "通过", "存疑", "淘汰", "录用", "面试后不符"]
+AUTH_STORE_PATH = ROOT / "config" / "auth_users.json"
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _password_valid(password: str) -> tuple[bool, str]:
+    if len(password) < 8:
+        return False, "密码至少 8 位。"
+    if not any(c.isupper() for c in password):
+        return False, "密码需包含至少 1 个大写字母。"
+    if not any(c.islower() for c in password):
+        return False, "密码需包含至少 1 个小写字母。"
+    if not any(c.isdigit() for c in password):
+        return False, "密码需包含至少 1 个数字。"
+    return True, ""
+
+
+def _default_auth_users() -> dict[str, dict]:
+    return {
+        "admin": {
+            "display_name": "系统管理员",
+            "role": "admin",
+            "enabled": True,
+            "password_hash": _sha256("Admin@123"),
+            "force_password_change": True,
+        },
+        "hr": {
+            "display_name": "HR 用户",
+            "role": "hr",
+            "enabled": True,
+            "password_hash": _sha256("Hr@123"),
+            "force_password_change": True,
+        },
+    }
+
+
+def _normalize_auth_users(raw_users: dict) -> dict[str, dict]:
+    users: dict[str, dict] = {}
+    for uname, item in raw_users.items():
+        if not isinstance(item, dict):
+            continue
+        username = str(uname).strip().lower()
+        if not username:
+            continue
+        role = str(item.get("role", "hr")).lower()
+        if role not in {"admin", "hr"}:
+            role = "hr"
+
+        pwd_hash = str(item.get("password_hash", "")).strip()
+        # 兼容旧字段 password，并立即升级为 hash 持久化
+        legacy_pwd = str(item.get("password", ""))
+        if not pwd_hash and legacy_pwd:
+            pwd_hash = _sha256(legacy_pwd)
+
+        if not pwd_hash:
+            continue
+
+        users[username] = {
+            "display_name": item.get("display_name", username),
+            "role": role,
+            "enabled": bool(item.get("enabled", True)),
+            "password_hash": pwd_hash,
+            "force_password_change": bool(item.get("force_password_change", False)),
+        }
+    return users
+
+
+def _save_auth_users(path: Path, users: dict[str, dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"users": users}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_auth_users() -> tuple[dict[str, dict], Path]:
+    # 1) 本地持久化文件优先
+    if AUTH_STORE_PATH.exists():
+        try:
+            data = json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
+            users = _normalize_auth_users(data.get("users", {})) if isinstance(data, dict) else {}
+            if users:
+                return users, AUTH_STORE_PATH
+        except Exception:
+            pass
+
+    # 2) 若本地不存在，则尝试 secrets / env 作为首次引导数据
+    seed_users: dict[str, dict] = {}
+    try:
+        secret_users = st.secrets.get("auth_users", None)
+        if isinstance(secret_users, dict):
+            seed_users = secret_users
+        elif isinstance(secret_users, list):
+            temp = {}
+            for item in secret_users:
+                if not isinstance(item, dict):
+                    continue
+                username = str(item.get("username", "")).strip().lower()
+                if username:
+                    temp[username] = item
+            seed_users = temp
+    except Exception:
+        seed_users = {}
+
+    if not seed_users:
+        raw = os.getenv("TALENTSCOPE_AUTH_USERS_JSON", "").strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    seed_users = data
+            except Exception:
+                seed_users = {}
+
+    users = _normalize_auth_users(seed_users) if seed_users else _default_auth_users()
+    _save_auth_users(AUTH_STORE_PATH, users)
+    return users, AUTH_STORE_PATH
+
+
+def _verify_user(auth_users: dict[str, dict], username: str, password: str) -> dict | None:
+    user = auth_users.get(username)
+    if not user:
+        return None
+
+    if not bool(user.get("enabled", True)):
+        return None
+
+    pwd_hash = str(user.get("password_hash", "")).strip()
+    if not pwd_hash or _sha256(password) != pwd_hash:
+        return None
+
+    role = str(user.get("role", "hr")).lower()
+    if role not in {"admin", "hr"}:
+        role = "hr"
+
+    return {
+        "username": username,
+        "display_name": user.get("display_name", username),
+        "role": role,
+        "force_password_change": bool(user.get("force_password_change", False)),
+    }
+
+
+def _ensure_auth(auth_users: dict[str, dict]) -> dict:
+    if "auth_user" not in st.session_state:
+        st.session_state["auth_user"] = None
+
+    user = st.session_state.get("auth_user")
+    if user:
+        return user
+
+    st.markdown("## 🔐 登录入口")
+    st.caption("管理员可操作后台配置与数据维护；HR 用户仅可浏览、筛选与发起简历评分。")
+
+    with st.form("login_form", clear_on_submit=False):
+        l1, l2 = st.columns(2)
+        with l1:
+            username = st.text_input("账号", placeholder="请输入账号，例如 admin 或 hr")
+        with l2:
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+        submit = st.form_submit_button("登录", width="stretch")
+
+    if submit:
+        authed = _verify_user(auth_users, username.strip().lower(), password)
+        if authed:
+            st.session_state["auth_user"] = authed
+            st.success(f"登录成功：{authed['display_name']}（{authed['role'].upper()}）")
+            st.rerun()
+        st.error("账号或密码错误，请重试。")
+
+    st.info("首次启动默认账号：admin / Admin@123，hr / Hr@123。首次登录将强制改密。")
+    st.stop()
+
+
+def _enforce_password_change(auth_users: dict[str, dict], auth_path: Path, auth_user: dict) -> None:
+    username = str(auth_user.get("username", "")).lower()
+    row = auth_users.get(username, {})
+    if not row.get("force_password_change", False):
+        return
+
+    st.warning("🔐 安全要求：首次登录或重置后必须先修改密码。")
+    with st.form("force_change_password_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            p1 = st.text_input("新密码", type="password", placeholder="至少 8 位，含大小写与数字")
+        with c2:
+            p2 = st.text_input("确认新密码", type="password")
+        submit = st.form_submit_button("更新密码", width="stretch")
+
+    if submit:
+        if p1 != p2:
+            st.error("两次输入的密码不一致。")
+            st.stop()
+        ok, msg = _password_valid(p1)
+        if not ok:
+            st.error(msg)
+            st.stop()
+
+        auth_users[username]["password_hash"] = _sha256(p1)
+        auth_users[username]["force_password_change"] = False
+        _save_auth_users(auth_path, auth_users)
+
+        refreshed = _verify_user(auth_users, username, p1)
+        if refreshed:
+            st.session_state["auth_user"] = refreshed
+        st.success("密码更新成功，请继续使用系统。")
+        st.rerun()
+
+    st.stop()
+
+
+def _render_account_admin_panel(auth_users: dict[str, dict], auth_path: Path, current_user: str) -> None:
+    st.markdown("### 👥 账号管理")
+    st.caption("管理员可新增账号、启停账号、重置密码。重置后将强制用户首次登录改密。")
+
+    view_rows = []
+    for username, item in sorted(auth_users.items()):
+        view_rows.append({
+            "账号": username,
+            "显示名": item.get("display_name", username),
+            "角色": "管理员" if item.get("role") == "admin" else "HR",
+            "启用": "是" if item.get("enabled", True) else "否",
+            "需改密": "是" if item.get("force_password_change", False) else "否",
+        })
+    st.dataframe(pd.DataFrame(view_rows), width="stretch", hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.form("create_user_form", clear_on_submit=True):
+            st.markdown("**➕ 新增账号**")
+            new_username = st.text_input("账号（英文/数字）", placeholder="例如 hr_south")
+            new_display = st.text_input("显示名", placeholder="例如 华南 HR")
+            new_role = st.selectbox("角色", ["hr", "admin"], format_func=lambda x: "HR" if x == "hr" else "管理员")
+            new_password = st.text_input("初始密码", type="password", placeholder="至少 8 位，含大小写与数字")
+            new_enabled = st.checkbox("创建后立即启用", value=True)
+            create_submit = st.form_submit_button("创建账号", width="stretch")
+
+        if create_submit:
+            uname = new_username.strip().lower()
+            if not uname:
+                st.error("账号不能为空。")
+            elif uname in auth_users:
+                st.error("账号已存在。")
+            else:
+                ok, msg = _password_valid(new_password)
+                if not ok:
+                    st.error(msg)
+                else:
+                    auth_users[uname] = {
+                        "display_name": (new_display or uname).strip(),
+                        "role": new_role,
+                        "enabled": bool(new_enabled),
+                        "password_hash": _sha256(new_password),
+                        "force_password_change": True,
+                    }
+                    _save_auth_users(auth_path, auth_users)
+                    st.success(f"已创建账号：{uname}")
+                    st.rerun()
+
+    with c2:
+        st.markdown("**🔧 账号维护**")
+        usernames = sorted(auth_users.keys())
+        if not usernames:
+            st.info("暂无账号。")
+            return
+
+        picked = st.selectbox("选择账号", usernames, key="auth_pick_user")
+        target = auth_users[picked]
+
+        new_state = st.selectbox(
+            "账号状态",
+            ["enabled", "disabled"],
+            index=0 if target.get("enabled", True) else 1,
+            format_func=lambda x: "启用" if x == "enabled" else "停用",
+            key="auth_user_state",
+        )
+        if st.button("保存账号状态", key="auth_save_state", width="stretch"):
+            if picked == current_user and new_state == "disabled":
+                st.error("不能停用当前登录账号。")
+            else:
+                if target.get("role") == "admin" and new_state == "disabled":
+                    enabled_admins = [
+                        u for u, item in auth_users.items()
+                        if item.get("role") == "admin" and item.get("enabled", True) and u != picked
+                    ]
+                    if not enabled_admins:
+                        st.error("至少需要保留 1 个启用状态的管理员账号。")
+                        st.stop()
+                auth_users[picked]["enabled"] = new_state == "enabled"
+                _save_auth_users(auth_path, auth_users)
+                st.success("账号状态已更新。")
+                st.rerun()
+
+        reset_pwd = st.text_input(
+            "重置为临时密码",
+            type="password",
+            placeholder="重置后该用户下次登录必须改密",
+            key="auth_reset_pwd",
+        )
+        if st.button("重置密码", key="auth_reset_pwd_btn", width="stretch"):
+            ok, msg = _password_valid(reset_pwd)
+            if not ok:
+                st.error(msg)
+            else:
+                auth_users[picked]["password_hash"] = _sha256(reset_pwd)
+                auth_users[picked]["force_password_change"] = True
+                _save_auth_users(auth_path, auth_users)
+                st.success(f"已重置账号 {picked} 的密码。")
+                st.rerun()
+
+
+def _fmt_lang(x, key="level"):
+    if isinstance(x, dict):
+        return f'{x.get("name", "?")}({x.get(key, "")})'
+    return str(x)
+
+
+def _status_label(score: float, threshold: int) -> str:
+    if score >= threshold:
+        return "🟢 推荐"
+    if score >= threshold - 15:
+        return "🟡 备选"
+    return "🔴 不推荐"
+
+
+def _render_result_details(candidates: list[dict], threshold: int) -> None:
+    valid_candidates = [c for c in candidates if "error" not in c]
+    if not valid_candidates:
+        return
+
+    st.markdown("### 🧾 评分证据与面试辅助")
+    for idx, candidate in enumerate(
+        sorted(valid_candidates, key=lambda item: item["match"]["total_score"], reverse=True)[:5],
+        1,
+    ):
+        match = candidate["match"]
+        resume = candidate["resume"]
+        title = f"Top {idx} · {candidate['file']} · {match['total_score']} 分 · {_status_label(match['total_score'], threshold)}"
+        with st.expander(title, expanded=(idx == 1)):
+            c1, c2, c3 = st.columns([1.15, 1, 1])
+            with c1:
+                st.markdown("**评分证据**")
+                for item in match.get("evidence_summary", []):
+                    st.markdown(f"- {item}")
+                evidence = match.get("evidence", {})
+                if evidence:
+                    st.caption(
+                        f"置信度 {match.get('confidence', '—')} · 亮点证据 {len(evidence.get('highlight_evidence', []))} 条"
+                    )
+                if match.get("recommendation"):
+                    st.info(match["recommendation"])
+            with c2:
+                st.markdown("**建议核验项**")
+                for item in match.get("follow_up_checks", []):
+                    st.markdown(f"- {item}")
+                if match.get("risks"):
+                    st.markdown("**风险提示**")
+                    for item in match.get("risks", []):
+                        st.markdown(f"- {item}")
+            with c3:
+                st.markdown("**建议追问**")
+                for question in match.get("interview_questions", []):
+                    st.markdown(f"- {question}")
+                if resume.get("highlights"):
+                    st.markdown("**简历亮点**")
+                    for item in resume.get("highlights", [])[:3]:
+                        st.markdown(f"- {item}")
+
+
+def _render_governance_panel() -> None:
+    st.markdown("### 🛡️ 评测与治理")
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown(
+            """
+            **决策原则**
+
+            - 评分仅作为招聘辅助，不替代人工录用决策
+            - 分数由本地规则稳定计算，便于复核与复现
+            - 推荐理由、追问建议由模型生成，但必须结合证据核验
+            - 优先关注岗位相关能力，不以非岗位因素做正向加分
+            """
+        )
+    with g2:
+        st.markdown(
+            """
+            **上线前检查**
+
+            - 先用试点样本校准岗位模板和门槛分数
+            - 对通过/淘汰结果保留人工反馈，形成评测集
+            - 对缺失技能、语言和经验缺口做面试复核
+            - 生产环境建议启用专属租户、网络隔离和日志审计
+            """
+        )
+
+
+def _render_feedback_metrics() -> None:
+    summary = lib.summarize_feedback()
+    st.markdown("### 📈 试点评测概览")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("反馈覆盖率", f"{summary['feedback_coverage']}%")
+    c2.metric("正向反馈率", f"{summary['positive_rate']}%")
+    c3.metric("负向反馈率", f"{summary['negative_rate']}%")
+    c4.metric("存疑占比", f"{summary['neutral_rate']}%")
+
+    if summary["records"]:
+        eval_df = pd.DataFrame(summary["records"])
+        csv = eval_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 下载反馈评测 CSV",
+            data=csv,
+            file_name="feedback_evaluation.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    st.caption("说明：当前评测基于人才库中的人工反馈状态汇总，用于试点阶段观察正向/负向反馈分布与覆盖率。")
+
+
+def _merge_required_languages(
+    base_langs: list[dict],
+    template_langs: list[dict],
+    lang_levels: list[str],
+) -> list[dict]:
+    merged: dict[str, dict] = {}
+    level_idx = {name: i for i, name in enumerate(lang_levels)}
+
+    def _pick_higher(current: str, incoming: str) -> str:
+        if incoming not in level_idx:
+            return current
+        if current not in level_idx:
+            return incoming
+        return incoming if level_idx[incoming] > level_idx[current] else current
+
+    for item in base_langs + template_langs:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        if name not in merged:
+            merged[name] = {"name": name, "min_level": item.get("min_level", "日常")}
+        else:
+            merged[name]["min_level"] = _pick_higher(
+                merged[name].get("min_level", "日常"),
+                item.get("min_level", "日常"),
+            )
+    return list(merged.values())
+
+
+def _render_template_detail(template: dict) -> None:
+    st.markdown("### 📐 模板严谨性说明")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("模板版本", template.get("version", "-") )
+    c2.metric("关键级别", template.get("criticality_level", "-") )
+    c3.metric("经验要求", f"{template.get('experience_years', 0)} 年+")
+
+    st.caption(template.get("business_context", ""))
+    with st.expander("查看职责与硬性要求", expanded=True):
+        st.markdown("**岗位职责**")
+        for item in template.get("responsibilities", []):
+            st.markdown(f"- {item}")
+
+        st.markdown("**硬性要求（含核验证据）**")
+        for req in template.get("hard_requirements", []):
+            st.markdown(f"- 要求：{req.get('requirement', '')}")
+            st.markdown(f"  理由：{req.get('rationale', '')}")
+            st.markdown(f"  证据：{req.get('evidence_hint', '')}")
+
+        if template.get("risk_controls"):
+            st.markdown("**风险控制点**")
+            for item in template.get("risk_controls", []):
+                st.markdown(f"- {item}")
+
+
+def _render_attrition_warning_panel(records: list[lib.LibraryRecord]) -> None:
+    st.markdown("### 🚨 人才流失预警面板")
+    st.caption("当关键岗位/部门的即战力后备人数低于阈值时自动预警。即战力口径：反馈状态为“通过”或“录用”。")
+
+    all_departments = sorted({r.department for r in records if r.department})
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        watch_departments = st.multiselect(
+            "关键岗位所属部门",
+            all_departments,
+            default=all_departments[: min(3, len(all_departments))],
+            key="attrition_watch_departments",
+        )
+    with col2:
+        min_ready = st.number_input("预警阈值（即战力人数）", min_value=1, max_value=20, value=2, step=1)
+
+    if not watch_departments:
+        st.info("请选择至少一个关键部门以启用预警。")
+        return
+
+    rows = []
+    suggestions = []
+    for dept in watch_departments:
+        dept_records = [r for r in records if r.department == dept]
+        total = len(dept_records)
+        ready = sum(1 for r in dept_records if r.feedback_status in {"通过", "录用"})
+        uncertain = sum(1 for r in dept_records if r.feedback_status == "存疑")
+        unreviewed = sum(1 for r in dept_records if r.feedback_status == "未反馈")
+        warning = "✅ 正常" if ready >= min_ready else "⚠️ 预警"
+        gap = max(0, int(min_ready) - ready)
+        if gap > 0:
+            action = (
+                f"{dept} 缺口 {gap} 人：优先从存疑候选中安排快速复核（当前 {uncertain} 人），"
+                f"并从未反馈候选中补充首轮筛选（当前 {unreviewed} 人）。"
+            )
+            suggestions.append(action)
+        rows.append({
+            "部门": dept,
+            "总人数": total,
+            "即战力人数": ready,
+            "存疑人数": uncertain,
+            "未反馈人数": unreviewed,
+            "阈值": int(min_ready),
+            "状态": warning,
+            "缺口": gap,
+        })
+
+    alert_df = pd.DataFrame(rows).sort_values(["状态", "缺口"], ascending=[False, False])
+    alert_count = int((alert_df["状态"] == "⚠️ 预警").sum())
+    c1, c2 = st.columns(2)
+    c1.metric("预警部门数", alert_count)
+    c2.metric("监控部门数", len(alert_df))
+    st.dataframe(alert_df, width="stretch", hide_index=True)
+    if alert_count > 0:
+        st.error("存在关键岗位后备风险，请优先补充即战力候选人或启动培养计划。")
+        st.markdown("**系统建议动作**")
+        for item in suggestions:
+            st.markdown(f"- {item}")
+
+        task_rows = []
+        for _, row in alert_df.iterrows():
+            if row["状态"] != "⚠️ 预警":
+                continue
+            task_rows.append({
+                "部门": row["部门"],
+                "任务类型": "紧急补位",
+                "优先级": "P1" if int(row["缺口"]) >= 2 else "P2",
+                "建议动作": f"在 3 个工作日内补齐 {int(row['缺口'])} 名即战力候选",
+                "执行建议": "优先复核存疑候选，其次从未反馈候选发起首轮筛选",
+                "负责人": "HRBP / 用人经理",
+            })
+
+        if task_rows:
+            st.markdown("**自动生成补位任务清单**")
+            task_df = pd.DataFrame(task_rows)
+            st.dataframe(task_df, width="stretch", hide_index=True)
+            task_csv = task_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下载补位任务清单 CSV",
+                data=task_csv,
+                file_name="attrition_recovery_tasks.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+
+def _estimate_template_fit(record: lib.LibraryRecord, template: dict, lang_levels: list[str]) -> dict:
+    parsed = record.parsed or {}
+    must_skills = {s.lower() for s in template.get("must_have_skills", [])}
+    cv_skills = {s.lower() for s in parsed.get("skills", [])}
+    matched = must_skills & cv_skills
+    skill_rate = len(matched) / len(must_skills) if must_skills else 1.0
+
+    level_idx = {name: i for i, name in enumerate(lang_levels)}
+    cv_lang = {x.get("name"): x.get("level", "") for x in (record.languages or []) if isinstance(x, dict)}
+    lang_total = len(template.get("required_languages", []))
+    lang_hit = 0
+    for req in template.get("required_languages", []):
+        name = req.get("name")
+        req_lvl = req.get("min_level", "日常")
+        cv_lvl = cv_lang.get(name, "")
+        if name in cv_lang and level_idx.get(cv_lvl, -1) >= level_idx.get(req_lvl, -1):
+            lang_hit += 1
+    lang_rate = lang_hit / lang_total if lang_total else 1.0
+
+    req_exp = float(template.get("experience_years", 0) or 0)
+    cv_exp = float(parsed.get("experience_years", 0) or 0)
+    exp_rate = min(cv_exp / req_exp, 1.0) if req_exp > 0 else 1.0
+    fit_score = round((skill_rate * 0.6 + lang_rate * 0.2 + exp_rate * 0.2) * 100, 1)
+
+    return {
+        "fit_score": fit_score,
+        "skill_rate": round(skill_rate * 100, 1),
+        "lang_rate": round(lang_rate * 100, 1),
+        "exp_rate": round(exp_rate * 100, 1),
+        "matched_skills": sorted(matched),
+        "missing_skills": sorted(must_skills - cv_skills),
+    }
+
+
+def _render_template_regression_panel(records: list[lib.LibraryRecord], templates: list[dict], lang_levels: list[str]) -> None:
+    st.markdown("### 🧪 模板回归检查")
+    st.caption("用于验证岗位模板在现有人才库中的可匹配性与风险，避免模板更新后偏离真实供给。")
+    if not templates:
+        st.info("未配置岗位模板。")
+        return
+    if not records:
+        st.info("人才库为空，无法执行模板回归检查。")
+        return
+
+    if st.button("▶ 运行模板回归检查", key="run_template_regression", width="stretch"):
+        overview_rows = []
+        detail_rows = []
+        for tpl in templates:
+            scored = []
+            for rec in records:
+                fit = _estimate_template_fit(rec, tpl, lang_levels)
+                scored.append((rec, fit))
+
+            scored.sort(key=lambda x: x[1]["fit_score"], reverse=True)
+            high_fit = [x for x in scored if x[1]["fit_score"] >= 75]
+            medium_fit = [x for x in scored if 60 <= x[1]["fit_score"] < 75]
+            risk = "低"
+            if len(high_fit) < 2:
+                risk = "高" if len(high_fit) == 0 else "中"
+
+            overview_rows.append({
+                "模板": tpl.get("name", tpl.get("id", "模板")),
+                "版本": tpl.get("version", "-"),
+                "高匹配人数(>=75)": len(high_fit),
+                "中匹配人数(60-74)": len(medium_fit),
+                "模板供给风险": risk,
+            })
+
+            for rec, fit in scored[:5]:
+                detail_rows.append({
+                    "模板": tpl.get("name", tpl.get("id", "模板")),
+                    "候选人": rec.display_name,
+                    "部门": rec.department,
+                    "匹配分": fit["fit_score"],
+                    "技能覆盖率": fit["skill_rate"],
+                    "语言覆盖率": fit["lang_rate"],
+                    "经验满足率": fit["exp_rate"],
+                    "缺失技能": ", ".join(fit["missing_skills"][:4]),
+                })
+
+        ov_df = pd.DataFrame(overview_rows)
+        dt_df = pd.DataFrame(detail_rows)
+        st.dataframe(ov_df, width="stretch", hide_index=True)
+        with st.expander("查看模板 Top 候选详情"):
+            st.dataframe(dt_df, width="stretch", hide_index=True)
+
+        csv1 = ov_df.to_csv(index=False).encode("utf-8-sig")
+        csv2 = dt_df.to_csv(index=False).encode("utf-8-sig")
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 下载模板回归概览 CSV", data=csv1, file_name="template_regression_overview.csv", mime="text/csv", width="stretch")
+        c2.download_button("📥 下载模板候选详情 CSV", data=csv2, file_name="template_regression_top_candidates.csv", mime="text/csv", width="stretch")
+
+
+def _safe_read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _render_ops_trend_panel() -> None:
+    st.markdown("### 📉 运营趋势看板")
+    out_dir = get_root() / cfg["storage"]["output_dir"]
+    feedback_files = sorted(out_dir.glob("feedback-evaluation-*.json"), reverse=True)[:12]
+    regression_files = sorted(out_dir.glob("template-regression-*.json"), reverse=True)[:12]
+
+    feedback_rows = []
+    for path in reversed(feedback_files):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        feedback_rows.append({
+            "批次": path.stem.replace("feedback-evaluation-", ""),
+            "反馈覆盖率": float(data.get("feedback_coverage", 0)),
+            "正向反馈率": float(data.get("positive_rate", 0)),
+            "负向反馈率": float(data.get("negative_rate", 0)),
+            "候选人总数": int(data.get("total_candidates", 0)),
+        })
+
+    regression_rows = []
+    for path in reversed(regression_files):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        templates = data.get("templates", [])
+        high_risk = sum(1 for t in templates if t.get("supply_risk") == "高")
+        mid_risk = sum(1 for t in templates if t.get("supply_risk") == "中")
+        regression_rows.append({
+            "批次": path.stem.replace("template-regression-", ""),
+            "高风险模板数": high_risk,
+            "中风险模板数": mid_risk,
+            "模板总数": len(templates),
+        })
+
+    if not feedback_rows and not regression_rows:
+        st.info("暂未发现趋势数据。请先运行反馈评测或模板回归检查。")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**反馈趋势（最近 12 批）**")
+        if feedback_rows:
+            fb_df = pd.DataFrame(feedback_rows)
+            st.line_chart(fb_df.set_index("批次")[["反馈覆盖率", "正向反馈率", "负向反馈率"]])
+            st.dataframe(fb_df, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无反馈趋势数据。")
+
+    with c2:
+        st.markdown("**模板供给风险趋势（最近 12 批）**")
+        if regression_rows:
+            rg_df = pd.DataFrame(regression_rows)
+            st.line_chart(rg_df.set_index("批次")[["高风险模板数", "中风险模板数"]])
+            st.dataframe(rg_df, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无模板风险趋势数据。")
+
+
+def _render_workflow_guide() -> None:
+    st.markdown("### 🧭 业务落地流程")
+    st.markdown(
+        """
+        1. **岗位补位**：输入 JD 或岗位需求，勾选关键技能与语言要求。
+        2. **人才筛选**：优先从简历库筛选候选人，必要时补充临时上传或新入职简历。
+        3. **后备池分层**：系统自动生成 A/B/C 三层后备池并提示岗位连续性风险。
+        4. **人工复核**：根据评分证据、建议追问和核验项完成面试决策。
+        5. **反馈沉淀**：将结果写回反馈闭环，持续提升岗位匹配质量。
+        """
+    )
+
+
+def _backup_band(score: float, confidence: float, threshold: int) -> str:
+    if score >= threshold + 10 and confidence >= 75:
+        return "A-即战力"
+    if score >= threshold - 5 and confidence >= 60:
+        return "B-培养型"
+    return "C-观察池"
+
+
+def _render_backup_pool(df: pd.DataFrame, threshold: int, vacancy_target: int) -> None:
+    if df.empty:
+        return
+
+    pool_df = df.copy()
+    pool_df["置信度"] = pd.to_numeric(pool_df["置信度"], errors="coerce").fillna(0)
+    pool_df["后备层级"] = pool_df.apply(
+        lambda r: _backup_band(float(r["总分"]), float(r["置信度"]), threshold),
+        axis=1,
+    )
+    pool_df["补位指数"] = (pool_df["总分"] * 0.7 + pool_df["置信度"] * 0.3).round(1)
+
+    ranked = pool_df.sort_values(["补位指数", "总分"], ascending=False)
+    shortlist_size = max(vacancy_target * 3, 5)
+    shortlist = ranked.head(shortlist_size)
+
+    ready_count = int((shortlist["后备层级"] == "A-即战力").sum())
+    backup_count = int((shortlist["后备层级"] == "B-培养型").sum())
+    risk_level = "低"
+    if ready_count < vacancy_target:
+        risk_level = "高" if ready_count == 0 else "中"
+
+    st.markdown("## 🧩 岗位补位后备池")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("补位目标人数", vacancy_target)
+    b2.metric("A层即战力", ready_count)
+    b3.metric("B层培养型", backup_count)
+    b4.metric("岗位连续性风险", risk_level)
+
+    st.caption("A 层可直接补位，B 层可定向培养，C 层建议暂不纳入近期补位计划。")
+    st.dataframe(
+        shortlist[["姓名", "部门", "总分", "置信度", "后备层级", "补位指数", "状态", "推荐理由"]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    csv = shortlist.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 下载岗位后备池 CSV",
+        data=csv,
+        file_name="succession_pool.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+
+# ---------------- 页面配置 ----------------
+st.set_page_config(
+    page_title="TalentScope · AI 简历匹配评分",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------- 主题 CSS（浅色天蓝科技风） ----------
+st.markdown(
+    """
+    <style>
+    /* 隐藏 Streamlit 顶部菜单与水印，让画面更干净 */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header[data-testid="stHeader"] {background: transparent;}
+
+    /* 主容器底色 */
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 2rem;
+        max-width: 1400px;
+        background:
+            radial-gradient(circle at 15% 18%, rgba(125, 211, 252, .16), transparent 32%),
+            radial-gradient(circle at 85% 9%, rgba(56, 189, 248, .14), transparent 28%),
+            radial-gradient(circle at 72% 82%, rgba(186, 230, 253, .30), transparent 38%),
+            linear-gradient(180deg, #f5fbff 0%, #edf7ff 100%);
+        border-radius: 14px;
+    }
+
+    /* ===== Hero 头条 ===== */
+    .ts-hero {
+        background:
+            linear-gradient(120deg, rgba(56, 189, 248, .94) 0%, rgba(59, 130, 246, .88) 52%, rgba(14, 165, 233, .85) 100%),
+            repeating-linear-gradient(
+                135deg,
+                rgba(255, 255, 255, .12) 0,
+                rgba(255, 255, 255, .12) 1px,
+                transparent 1px,
+                transparent 12px
+            );
+        padding: 28px 32px;
+        border-radius: 18px;
+        color: #fff;
+        margin-bottom: 18px;
+        box-shadow: 0 10px 28px rgba(14, 116, 144, .26);
+        position: relative;
+        overflow: hidden;
+    }
+    .ts-hero::before {
+        content: "";
+        position: absolute;
+        right: -20px;
+        top: -22px;
+        width: 260px;
+        height: 260px;
+        border-radius: 50%;
+        border: 2px solid rgba(255,255,255,.34);
+        box-shadow:
+            0 0 0 22px rgba(255,255,255,.10),
+            0 0 0 44px rgba(255,255,255,.07);
+    }
+    .ts-hero::after {
+        content: "AI";
+        position: absolute;
+        right: 30px;
+        bottom: 8px;
+        font-size: 84px;
+        font-weight: 800;
+        letter-spacing: 4px;
+        color: rgba(255,255,255,.16);
+        text-shadow: 0 1px 0 rgba(255,255,255,.2);
+    }
+    .ts-hero h1 {
+        font-size: 34px; font-weight: 800; margin: 0 0 6px 0;
+        letter-spacing: 1px; line-height: 1.1;
+        text-shadow: 0 2px 8px rgba(0,0,0,.15);
+    }
+    .ts-hero p {
+        font-size: 14px; margin: 0; opacity: .92;
+    }
+    .ts-hero .badges {margin-top: 12px;}
+    .ts-hero .badge {
+        display: inline-block; padding: 4px 12px; margin-right: 8px;
+        background: rgba(255,255,255,.18); border-radius: 999px;
+        font-size: 12px; backdrop-filter: blur(6px);
+        border: 1px solid rgba(255,255,255,.28);
+    }
+
+    /* ===== 玻璃质感状态卡 ===== */
+    .glass-card {
+        background: linear-gradient(145deg, rgba(255,255,255,.96) 0%, rgba(238,248,255,.78) 100%);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(186, 230, 253, .9);
+        border-radius: 14px;
+        padding: 16px 18px;
+        box-shadow: 0 6px 18px rgba(14, 116, 144, .10);
+        transition: transform .18s ease, box-shadow .18s ease;
+        height: 100%;
+    }
+    .glass-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 22px rgba(17,17,26,.1);
+    }
+    .glass-card .label {
+        font-size: 11px; font-weight: 600;
+        color: #6b7280; text-transform: uppercase; letter-spacing: 1px;
+        margin-bottom: 6px;
+    }
+    .glass-card .value {
+        font-size: 18px; font-weight: 700;
+        background: linear-gradient(90deg, #0284c7, #0369a1);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    .glass-card .sub {
+        font-size: 12px; color: #9ca3af; margin-top: 4px;
+    }
+
+    /* ===== 模型选择卡片 ===== */
+    .model-card {
+        background: linear-gradient(135deg, #f0f9ff, #ffffff);
+        border: 1px solid #bae6fd; border-radius: 12px;
+        padding: 14px 16px; margin-bottom: 10px;
+    }
+    .model-card .head {
+        font-size: 15px; font-weight: 700; color: #1e293b;
+    }
+    .model-card .tag {
+        display: inline-block; font-size: 10px; padding: 2px 8px;
+        border-radius: 6px; margin-left: 8px; vertical-align: middle;
+    }
+    .tag-cn  {background: #fee2e2; color: #b91c1c;}
+    .tag-local {background: #dcfce7; color: #15803d;}
+    .tag-intl {background: #dbeafe; color: #1d4ed8;}
+    .tag-demo {background: #fef3c7; color: #92400e;}
+
+    /* ===== Tab 美化 ===== */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px; border-bottom: none;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background: #e0f2fe; border-radius: 10px 10px 0 0;
+        padding: 10px 22px; font-weight: 600;
+        border: none !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #38bdf8, #0ea5e9) !important;
+        color: white !important;
+        box-shadow: 0 4px 12px rgba(14,165,233,.35);
+    }
+
+    /* ===== 按钮强化 ===== */
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 10px; font-weight: 600;
+        transition: all .18s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 14px rgba(14,165,233,.25);
+    }
+    .stForm button[kind="formSubmit"] {
+        background: linear-gradient(135deg, #38bdf8, #0284c7);
+        color: white; border: none;
+    }
+
+    /* 输入控件圆角 */
+    .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] > div,
+    .stNumberInput input {
+        border-radius: 10px !important;
+    }
+
+    /* 分割线渐变 */
+    hr {
+        border: none;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, #7dd3fc, transparent);
+        margin: 18px 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------- Hero ----------
+st.markdown(
+    """
+    <div class="ts-hero">
+        <h1>🎯 TalentScope</h1>
+        <p>AI 简历智能匹配评分系统 · 博彦科技 2026 AI 大奖参赛项目</p>
+        <div class="badges">
+            <span class="badge">🤖 多模型可切换</span>
+            <span class="badge">🇨🇳 国产 5 大 + 🏠 本地部署</span>
+            <span class="badge">🔒 PII 脱敏</span>
+            <span class="badge">📊 5 维评分</span>
+            <span class="badge">📄 一键报告</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------- 加载配置 ----------------
+try:
+    cfg = get_config()
+    taxonomy = get_skills_taxonomy()
+    lang_cfg = get_languages()
+    dept_cfg = get_departments()
+    template_cfg = get_job_templates()
+except Exception as e:
+    st.error(f"配置加载失败：{e}")
+    st.stop()
+
+LANG_NAMES = [l["name"] for l in lang_cfg["languages"]]
+LANG_LEVELS = lang_cfg.get("levels", ["入门", "日常", "流利", "母语"])
+DEPT_NAMES = [d["name"] for d in dept_cfg["departments"]]
+TEMPLATES = template_cfg.get("templates", [])
+
+# ---------------- 登录与角色 ----------------
+AUTH_USERS, AUTH_PATH = _load_auth_users()
+AUTH_USER = _ensure_auth(AUTH_USERS)
+_enforce_password_change(AUTH_USERS, AUTH_PATH, AUTH_USER)
+IS_ADMIN = AUTH_USER.get("role") == "admin"
+ROLE_TEXT = "管理员" if IS_ADMIN else "HR 用户"
+
+# ---------------- 顶部状态条（玻璃卡） ----------------
+c1, c2, c3, c4 = st.columns(4)
+_llm = cfg.get("llm", {})
+_prov_id = _llm.get("provider") or _llm.get("mode") or "mock"
+_prov_info = get_provider(_prov_id) or {}
+_prov_name = f"{_prov_info.get('emoji','')} {_prov_info.get('name', _prov_id)}".strip()
+_prov_group = _prov_info.get("group", "—")
+_model_name = _llm.get("model") or _prov_info.get("default_model", "-")
+stats0 = lib.stats()
+d_on = "✅ 已启用" if cfg["desensitize"]["enabled"] else "⚠️ 已关闭"
+
+with c1:
+    st.markdown(
+        f'<div class="glass-card"><div class="label">🤖 当前模型</div>'
+        f'<div class="value">{_prov_name}</div>'
+        f'<div class="sub">📦 {_model_name} · {_prov_group}</div></div>',
+        unsafe_allow_html=True,
+    )
+with c2:
+    st.markdown(
+        f'<div class="glass-card"><div class="label">🔒 PII 脱敏</div>'
+        f'<div class="value">{d_on}</div>'
+        f'<div class="sub">姓名 / 手机 / 邮箱 等敏感字段</div></div>',
+        unsafe_allow_html=True,
+    )
+with c3:
+    st.markdown(
+        f'<div class="glass-card"><div class="label">📚 简历库</div>'
+        f'<div class="value">{stats0["total"]} 人</div>'
+        f'<div class="sub">{len(stats0["by_department"])} 个部门 · {len(stats0["by_language"])} 种语言</div></div>',
+        unsafe_allow_html=True,
+    )
+with c4:
+    st.markdown(
+        f'<div class="glass-card"><div class="label">👤 当前身份</div>'
+        f'<div class="value">{ROLE_TEXT}</div>'
+        f'<div class="sub">{AUTH_USER.get("display_name", AUTH_USER.get("username", ""))}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+tab1, tab2, tab3 = st.tabs([
+    "📋  JD 匹配评分",
+    "📚  简历库管理",
+    "⚙️  管理员设置",
+])
+
+
+# ===================================================================
+# Tab 1 · JD 匹配评分
+# ===================================================================
+with tab1:
+    _render_workflow_guide()
+    st.markdown("---")
+
+    left, right = st.columns([1, 1])
+    template_required_skills: list[str] = []
+    template_required_languages: list[dict] = []
+    apply_template_constraints = False
+
+    with left:
+        st.subheader("① 岗位模板（严谨版）")
+        template_opts = ["不使用模板"] + [t.get("name", t.get("id", "模板")) for t in TEMPLATES]
+        selected_template_name = st.selectbox("选择岗位模板", template_opts, index=0)
+        selected_template = None
+        if selected_template_name != "不使用模板":
+            selected_template = next((t for t in TEMPLATES if t.get("name") == selected_template_name), None)
+            if selected_template:
+                _render_template_detail(selected_template)
+                if st.button("📥 应用模板JD文本", key="apply_template_jd"):
+                    st.session_state["jd_template_prefill"] = selected_template.get("jd_text", "")
+                    st.rerun()
+                apply_template_constraints = st.checkbox("将模板硬性条件并入评分", value=True)
+                template_required_skills = selected_template.get("must_have_skills", [])
+                template_required_languages = selected_template.get("required_languages", [])
+
+        st.markdown("---")
+        st.subheader("② 岗位描述 (JD)")
+        jd_source = st.radio("输入方式", ["✍️ 手动粘贴", "📁 上传示例 JD"], horizontal=True, label_visibility="collapsed")
+        if jd_source == "📁 上传示例 JD":
+            sample_jd_path = get_root() / "data" / "samples" / "sample_jd.txt"
+            default_jd = sample_jd_path.read_text(encoding="utf-8") if sample_jd_path.exists() else ""
+        else:
+            default_jd = ""
+        if "jd_template_prefill" in st.session_state:
+            default_jd = st.session_state.pop("jd_template_prefill")
+        jd_text = st.text_area("JD 内容", value=default_jd, height=220,
+                                placeholder="例如：招聘高级 Python 后端工程师，5 年以上经验...",
+                                label_visibility="collapsed")
+
+        st.subheader("③ 必备技能（多选）")
+        selected_skills: list[str] = []
+        categories = taxonomy["categories"]
+        cat_names = list(categories.keys())
+        sk_tabs = st.tabs(cat_names)
+        for stab, cat_name in zip(sk_tabs, cat_names):
+            with stab:
+                skills = categories[cat_name]
+                cols = st.columns(3)
+                for i, sk in enumerate(skills):
+                    with cols[i % 3]:
+                        if st.checkbox(sk, key=f"sk_{cat_name}_{sk}"):
+                            selected_skills.append(sk)
+        if selected_skills:
+            st.success(f"✅ 已选 {len(selected_skills)} 项必备技能")
+        if apply_template_constraints and template_required_skills:
+            st.info(f"模板追加必备技能：{', '.join(template_required_skills)}")
+
+        st.subheader("④ 语言要求（多选）")
+        st.caption("勾选岗位需要的语言并选择最低等级。")
+        required_languages: list[dict] = []
+        lcols = st.columns(2)
+        for idx, lname in enumerate(LANG_NAMES):
+            with lcols[idx % 2]:
+                row = st.columns([1, 1])
+                with row[0]:
+                    chk = st.checkbox(lname, key=f"lang_{lname}")
+                with row[1]:
+                    lvl = st.selectbox(" ", LANG_LEVELS, index=1, key=f"lvl_{lname}",
+                                       label_visibility="collapsed", disabled=not chk)
+                if chk:
+                    required_languages.append({"name": lname, "min_level": lvl})
+        if apply_template_constraints and template_required_languages:
+            tips = [f"{x.get('name', '')}({x.get('min_level', '')})" for x in template_required_languages]
+            st.info(f"模板追加语言要求：{', '.join(tips)}")
+
+    with right:
+        st.subheader("⑤ 简历来源")
+        src = st.radio("选择来源", ["📤 临时上传", "🗂️ 从简历库选人"], horizontal=True)
+
+        uploaded_files = []
+        sample_resumes: list[ResumeInput] = []
+        picked_records = []
+
+        if src == "📤 临时上传":
+            uploaded_files = st.file_uploader(
+                "支持 PDF / DOCX / TXT，可一次上传多份",
+                type=["pdf", "docx", "txt", "md"], accept_multiple_files=True,
+            )
+            use_samples = st.checkbox("📁 使用示例简历进行体验", value=not uploaded_files)
+            if use_samples:
+                sample_dir = get_root() / "data" / "samples" / "sample_resumes"
+                if sample_dir.exists():
+                    for p in sorted(sample_dir.iterdir()):
+                        if p.suffix.lower() in (".pdf", ".docx", ".txt", ".md"):
+                            sample_resumes.append(ResumeInput(filename=p.name, file=p))
+                    st.info(f"已加载 {len(sample_resumes)} 份示例简历")
+        else:
+            st.caption("先按部门 / 语言筛选，再从结果中选择参与匹配的人员。")
+            dept_filter = st.multiselect("筛选部门", DEPT_NAMES, default=[])
+            lang_filter = st.multiselect("必须掌握的语言", LANG_NAMES, default=[])
+            kw = st.text_input("关键字（姓名 / 技能 / 部门）", "")
+            cand_records = lib.filter_records(
+                departments=dept_filter or None,
+                must_languages=lang_filter or None,
+                keyword=kw,
+            )
+            st.info(f"匹配到 {len(cand_records)} 份简历")
+            if cand_records:
+                opts = {f"{r.display_name} · {r.department}": r for r in cand_records}
+                sel = st.multiselect("选择参与评分的人员（默认全选）",
+                                     list(opts.keys()), default=list(opts.keys()))
+                picked_records = [opts[s] for s in sel]
+
+        st.subheader("⑥ 评分参数")
+        threshold = st.slider("通过门槛分数", 0, 100, cfg["scoring"].get("min_score_threshold", 60))
+        top_n = st.slider("展示 Top N", 1, 50, 10)
+        vacancy_target = st.slider("岗位补位目标人数", 1, 10, 3)
+        enable_backup_pool = st.checkbox("启用岗位连续性补位分析", value=True)
+
+    st.markdown("---")
+    can_run = bool(jd_text.strip()) and (
+        uploaded_files or sample_resumes or picked_records
+    )
+    run_btn = st.button("🚀 开始 AI 评分", type="primary",
+                         width="stretch", disabled=not can_run)
+
+    if run_btn:
+        progress_bar = st.progress(0.0)
+        status = st.empty()
+
+        def _cb(msg, pct):
+            progress_bar.progress(pct)
+            status.info(msg)
+
+        with st.spinner("AI 团队工作中..."):
+            merged_skills = selected_skills[:]
+            merged_langs = required_languages[:]
+            if apply_template_constraints and selected_template:
+                merged_skills = sorted(set(merged_skills + template_required_skills))
+                merged_langs = _merge_required_languages(merged_langs, template_required_languages, LANG_LEVELS)
+
+            if src == "🗂️ 从简历库选人":
+                result = run_from_library(
+                    jd_text=jd_text,
+                    records=picked_records,
+                    required_skill_filter=merged_skills or None,
+                    required_languages=merged_langs or None,
+                    progress_cb=_cb,
+                )
+            else:
+                if uploaded_files:
+                    resume_inputs = [ResumeInput(filename=f.name, file=io.BytesIO(f.getvalue()))
+                                     for f in uploaded_files]
+                else:
+                    resume_inputs = sample_resumes
+                result = run_pipeline(
+                    jd_text=jd_text, resumes=resume_inputs,
+                    required_skill_filter=merged_skills or None,
+                    required_languages=merged_langs or None,
+                    progress_cb=_cb,
+                )
+
+        status.success(f"✅ 完成！报告已保存到 `{result.report_path}`")
+        progress_bar.empty()
+
+        st.markdown("## 📊 评分结果")
+        rows = []
+        feedback_map = {}
+        if src == "🗂️ 从简历库选人":
+            feedback_map = {r.id: r.feedback_status for r in picked_records}
+        for c in result.candidates:
+            if "error" in c:
+                rows.append({"姓名": c["file"], "部门": c.get("department", "—"),
+                             "总分": 0, "状态": "❌ " + c["error"]})
+                continue
+            m = c["match"]
+            d = m["dimensions"]
+
+            matched_l = ", ".join(_fmt_lang(x, "level") for x in m.get("matched_languages", []))
+            missing_l = ", ".join(_fmt_lang(x, "min_level") for x in m.get("missing_languages", []))
+            rows.append({
+                "姓名": c["file"],
+                "部门": c.get("department", "—"),
+                "总分": m["total_score"],
+                "置信度": m.get("confidence", 0),
+                "硬技能": d.get("hard_skill", 0),
+                "经验": d.get("experience", 0),
+                "语言": d.get("language", 0),
+                "软技能": d.get("soft_skill", 0),
+                "学历": d.get("education", 0),
+                "匹配技能": ", ".join(m.get("matched_skills", [])),
+                "缺失技能": ", ".join(m.get("missing_skills", [])),
+                "匹配语言": matched_l,
+                "缺失语言": missing_l,
+                "反馈状态": feedback_map.get(c.get("library_id", ""), "未反馈"),
+                "推荐理由": m.get("recommendation", ""),
+            })
+        df = pd.DataFrame(rows).sort_values("总分", ascending=False).head(top_n).reset_index(drop=True)
+        df["状态"] = df["总分"].apply(lambda s: _status_label(s, threshold))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("候选人总数", len(result.candidates))
+        m2.metric("达标人数", int((df["总分"] >= threshold).sum()))
+        m3.metric("最高分", df["总分"].max() if not df.empty else 0)
+        m4.metric("平均分", round(df["总分"].mean(), 1) if not df.empty else 0)
+
+        st.dataframe(df, width="stretch", hide_index=True)
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.download_button("📥 下载 Markdown 报告", data=result.report_md,
+                                file_name=result.report_path.name if result.report_path else "report.md",
+                                mime="text/markdown", width="stretch")
+        with col_d2:
+            csv = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 下载 CSV 排序表", data=csv,
+                                file_name="ranking.csv", mime="text/csv",
+                                width="stretch")
+
+        with st.expander("📄 查看完整报告"):
+            st.markdown(result.report_md)
+        with st.expander("🔍 查看 JD 解析结果"):
+            st.json(result.jd)
+        _render_result_details(result.candidates, threshold)
+        if enable_backup_pool:
+            _render_backup_pool(df, threshold, vacancy_target)
+
+
+# ===================================================================
+# Tab 2 · 简历库管理
+# ===================================================================
+with tab2:
+    st.info("🚀 新入职人员接入建议：先导入简历到人才库 → 自动解析评分要素 → 再在岗位补位流程中统一筛选，确保岗位填补无缝衔接。")
+    st.subheader("📥 批量导入简历到人才库")
+    if not IS_ADMIN:
+        st.caption("当前为 HR 只读权限：可浏览与筛选，导入/编辑/删除/反馈维护仅管理员可操作。")
+    imp_col1, imp_col2 = st.columns([2, 1])
+    with imp_col1:
+        imp_files = st.file_uploader(
+            "选择简历（PDF / DOCX / TXT），可多选",
+            type=["pdf", "docx", "txt", "md"], accept_multiple_files=True,
+            key="lib_upload",
+        )
+    with imp_col2:
+        imp_dept = st.selectbox("归属部门", DEPT_NAMES, key="imp_dept")
+
+    if st.button("🚀 开始导入", type="primary", disabled=(not imp_files) or (not IS_ADMIN)):
+        prog = st.progress(0.0)
+        ok, fail = 0, 0
+        for i, f in enumerate(imp_files):
+            prog.progress((i + 1) / len(imp_files))
+            try:
+                lib.import_resume(
+                    file=io.BytesIO(f.getvalue()),
+                    filename=f.name,
+                    department=imp_dept,
+                    desensitize_enabled=cfg["desensitize"]["enabled"],
+                )
+                ok += 1
+            except Exception as e:
+                st.warning(f"❌ {f.name} 导入失败：{e}")
+                fail += 1
+        prog.empty()
+        st.success(f"完成：成功 {ok} 份，失败 {fail} 份")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("📚 当前简历库")
+
+    stats1 = lib.stats()
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("总人数", stats1["total"])
+    s2.metric("覆盖部门数", len(stats1["by_department"]))
+    s3.metric("覆盖语言数", len(stats1["by_language"]))
+    s4.metric("已反馈人数", stats1.get("by_feedback", {}).get("未反馈", 0) and stats1["total"] - stats1.get("by_feedback", {}).get("未反馈", 0) or 0)
+
+    if stats1["by_department"]:
+        with st.expander("📊 按部门分布"):
+            st.bar_chart(pd.Series(stats1["by_department"]))
+    if stats1["by_language"]:
+        with st.expander("🌐 按语言分布"):
+            st.bar_chart(pd.Series(stats1["by_language"]))
+    if stats1.get("by_feedback"):
+        with st.expander("🗳️ 反馈状态分布"):
+            st.bar_chart(pd.Series(stats1["by_feedback"]))
+
+    _render_feedback_metrics()
+    _render_template_regression_panel(lib.list_records(), TEMPLATES, LANG_LEVELS)
+    _render_attrition_warning_panel(lib.list_records())
+
+    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+    with fcol1:
+        f_dept = st.multiselect("筛选部门", DEPT_NAMES, key="f_dept")
+    with fcol2:
+        f_lang = st.multiselect("必须包含语言", LANG_NAMES, key="f_lang")
+    with fcol3:
+        f_kw = st.text_input("关键字", "", key="f_kw")
+    with fcol4:
+        f_feedback = st.multiselect("反馈状态", FEEDBACK_OPTIONS, key="f_feedback")
+
+    records = lib.filter_records(f_dept or None, f_lang or None, f_kw)
+    if f_feedback:
+        feedback_set = set(f_feedback)
+        records = [r for r in records if r.feedback_status in feedback_set]
+
+    if not records:
+        st.info("当前条件下无记录。")
+    else:
+        rows = []
+        for r in records:
+            rows.append({
+                "ID": r.id,
+                "姓名": r.display_name,
+                "部门": r.department,
+                "语言": ", ".join(f'{l["name"]}({l.get("level","")})' for l in r.languages),
+                "技能数": len(r.parsed.get("hard_skills", [])),
+                "反馈状态": r.feedback_status,
+                "反馈时间": r.feedback_updated_at or "—",
+                "导入时间": r.imported_at,
+                "来源文件": r.source_file,
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        st.markdown("#### ✏️ 编辑 / 删除单条记录")
+        rec_map = {f"{r.display_name} ({r.id})": r for r in records}
+        pick = st.selectbox("选择一条记录", list(rec_map.keys()))
+        if pick:
+            rec = rec_map[pick]
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                new_name = st.text_input("姓名", rec.display_name, key=f"ed_n_{rec.id}")
+                new_dept = st.selectbox("部门", DEPT_NAMES,
+                                         index=DEPT_NAMES.index(rec.department) if rec.department in DEPT_NAMES else 0,
+                                         key=f"ed_d_{rec.id}")
+            with ec2:
+                new_notes = st.text_area("备注", rec.notes, key=f"ed_no_{rec.id}", height=100)
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("💾 保存修改", key=f"sv_{rec.id}", width="stretch", disabled=not IS_ADMIN):
+                    lib.update_record(rec.id, display_name=new_name,
+                                       department=new_dept, notes=new_notes)
+                    st.success("已保存")
+                    st.rerun()
+            with b2:
+                if st.button("🗑️ 删除", key=f"del_{rec.id}", type="secondary", width="stretch", disabled=not IS_ADMIN):
+                    lib.delete_record(rec.id)
+                    st.warning("已删除")
+                    st.rerun()
+
+            with st.expander("🔍 查看解析详情"):
+                st.json(rec.parsed)
+
+            st.markdown("#### 🗳️ 人工反馈闭环")
+            fb1, fb2 = st.columns([1, 1.5])
+            with fb1:
+                current_idx = FEEDBACK_OPTIONS.index(rec.feedback_status) if rec.feedback_status in FEEDBACK_OPTIONS else 0
+                feedback_status = st.selectbox(
+                    "反馈结论",
+                    FEEDBACK_OPTIONS,
+                    index=current_idx,
+                    key=f"fb_status_{rec.id}",
+                )
+                st.caption(f"最近更新时间：{rec.feedback_updated_at or '暂无'}")
+            with fb2:
+                feedback_note = st.text_area(
+                    "反馈说明",
+                    rec.feedback_note,
+                    key=f"fb_note_{rec.id}",
+                    height=110,
+                    placeholder="例如：面试通过，项目深度符合预期；或：关键词匹配高，但实操深度不足。",
+                )
+            if st.button("💾 保存反馈", key=f"fb_save_{rec.id}", width="stretch", disabled=not IS_ADMIN):
+                lib.update_feedback(rec.id, feedback_status, feedback_note)
+                st.success("反馈已保存，可用于后续试点评测和规则校准。")
+                st.rerun()
+
+            if rec.feedback_history:
+                with st.expander("🕘 查看反馈历史"):
+                    st.dataframe(pd.DataFrame(rec.feedback_history[::-1]), width="stretch", hide_index=True)
+
+
+# ===================================================================
+# Tab 3 · 语言 & 部门管理（管理员 DIY）
+# ===================================================================
+with tab3:
+    if not IS_ADMIN:
+        st.warning("当前账号为 HR 用户：管理员设置仅可查看，不可修改。")
+    else:
+        _render_account_admin_panel(AUTH_USERS, AUTH_PATH, AUTH_USER.get("username", ""))
+        st.markdown("---")
+
+    # ============ 🤖 LLM 模型选择（管理员） ============
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#f0f4ff,#fdf2ff);
+                    padding:18px 22px;border-radius:14px;margin-bottom:14px;
+                    border-left:4px solid #764ba2;">
+            <h3 style="margin:0;color:#1e293b;">🤖 LLM 模型选择中心</h3>
+            <p style="margin:6px 0 0 0;color:#475569;font-size:13px;">
+                按分组下拉切换底层 AI 引擎 · 支持
+                <b style="color:#b91c1c">国产 5 大</b> ·
+                <b style="color:#15803d">本地私有部署</b> ·
+                <b style="color:#1d4ed8">国际云服务</b> ·
+                <b style="color:#92400e">离线 Mock</b>
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    catalog = get_models_catalog()
+    providers = catalog.get("providers", [])
+    if not providers:
+        st.error("⚠️ 未找到模型目录 config/models_catalog.json，请检查项目完整性。")
+        st.stop()
+
+    llm_cfg = dict(cfg.get("llm", {}))
+    cur_provider = llm_cfg.get("provider") or llm_cfg.get("mode") or catalog.get("default_provider", "deepseek")
+
+    provider_ids = [p["id"] for p in providers]
+    if cur_provider not in provider_ids:
+        cur_provider = provider_ids[0]
+
+    # 标签函数：把 emoji + 分组 + 名字组合
+    def _fmt_prov(pid: str) -> str:
+        p = next((x for x in providers if x["id"] == pid), {})
+        return f"{p.get('emoji','')} {p.get('name', pid)}  ·  [{p.get('group','')}]"
+
+    # ----- 1. 模型供应商分组下拉 -----
+    new_provider = st.selectbox(
+        "🎯 选择模型供应商（按分组）",
+        options=provider_ids,
+        index=provider_ids.index(cur_provider),
+        format_func=_fmt_prov,
+        key="llm_provider_pick",
+    )
+    prov = get_provider(new_provider) or {}
+    api_type = prov.get("api_type", "mock")
+
+    # ----- 2. 当前模型信息卡 -----
+    tag_class = {
+        "国产 · 在线": "tag-cn",
+        "本地 · 私有部署": "tag-local",
+        "国际 · 云服务": "tag-intl",
+        "演示 · 离线": "tag-demo",
+    }.get(prov.get("group", ""), "tag-demo")
+
+    st.markdown(
+        f"""
+        <div class="model-card">
+            <div class="head">
+                {prov.get('emoji','')} {prov.get('name','-')}
+                <span class="tag {tag_class}">{prov.get('group','')}</span>
+            </div>
+            <div style="color:#475569;font-size:13px;margin-top:6px;">{prov.get('tagline','')}</div>
+            <div style="color:#64748b;font-size:12px;margin-top:8px;">
+                🌐 <code>{prov.get('api_base') or '（Azure 由用户填写 endpoint）'}</code>
+            </div>
+            <div style="color:#64748b;font-size:12px;margin-top:4px;">
+                🔑 {prov.get('key_hint','-')}
+            </div>
+            <div style="color:#64748b;font-size:12px;margin-top:4px;">
+                📚 {prov.get('docs','-')}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ----- 3. 本地模式额外一键自检 -----
+    if api_type == "openai_compatible" and prov.get("no_key"):
+        st.info(
+            f"🏠 **本地模式**：先确保本地服务已在 `{prov.get('api_base')}` 启动。"
+            f"你可以通过下方"
+            f"「💾 保存」或「🧪 保存并连接测试」来验证。"
+        )
+
+    # ----- 4. 配置表单 -----
+    with st.form("llm_form", clear_on_submit=False):
+        # 模型下拉
+        model_options = list(prov.get("models", []) or [prov.get("default_model", "")])
+        same_provider = new_provider == (llm_cfg.get("provider") or llm_cfg.get("mode"))
+        if same_provider:
+            cur_model = llm_cfg.get("model") or prov.get("default_model") or model_options[0]
+        else:
+            cur_model = prov.get("default_model") or model_options[0]
+        if cur_model not in model_options:
+            model_options = [cur_model] + model_options
+
+        model_name = st.selectbox(
+            "📦 选择模型",
+            options=model_options,
+            index=model_options.index(cur_model),
+            help="若想新增模型名，直接编辑 config/models_catalog.json 即可。",
+        )
+
+        # 字段按 api_type 切换
+        api_key = ""
+        api_base = prov.get("api_base", "")
+        azure_endpoint = ""
+        azure_deployment = ""
+        azure_api_version = ""
+
+        if api_type == "mock":
+            st.success("🧪 Mock 模式无需任何配置，直接使用本地规则模拟 LLM 输出。")
+        elif api_type == "openai_compatible":
+            need_key = not prov.get("no_key", False)
+            api_key = st.text_input(
+                "🔑 API Key" + (" （本地模式可留空）" if not need_key else ""),
+                value=llm_cfg.get("api_key", "") if same_provider else "",
+                type="password",
+                placeholder="留空 = 本地服务无鉴权" if not need_key else "粘贴你的 sk-xxxx",
+            )
+            api_base = st.text_input(
+                "🌐 API Base URL",
+                value=(llm_cfg.get("api_base") if same_provider else prov.get("api_base", "")) or prov.get("api_base", ""),
+                help="可改写为自建网关 / 反向代理 / 局域网内网地址。",
+            )
+        elif api_type == "azure_openai":
+            azure_endpoint = st.text_input(
+                "🌐 Azure Endpoint",
+                value=llm_cfg.get("azure_endpoint", ""),
+                placeholder="https://your-resource.openai.azure.com/",
+            )
+            api_key = st.text_input(
+                "🔑 Azure API Key",
+                value=llm_cfg.get("azure_api_key", ""),
+                type="password",
+            )
+            azure_deployment = st.text_input(
+                "📌 部署名（Deployment）",
+                value=llm_cfg.get("azure_deployment", model_name),
+                help="Azure 上你创建的部署名，可与模型名不同。",
+            )
+            azure_api_version = st.text_input(
+                "🗓 API Version",
+                value=llm_cfg.get("azure_api_version", "2024-08-01-preview"),
+            )
+
+        # 通用参数
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            temp = st.slider("🌡 Temperature", 0.0, 1.5,
+                             float(llm_cfg.get("temperature", 0.2)), 0.05,
+                             disabled=(api_type == "mock"))
+        with tc2:
+            mx = st.number_input("📏 Max Tokens", 256, 16000,
+                                 int(llm_cfg.get("max_tokens", 2000)), 128,
+                                 disabled=(api_type == "mock"))
+
+        bsave, btest = st.columns(2)
+        with bsave:
+            do_save = st.form_submit_button("💾 保存配置", width="stretch", disabled=not IS_ADMIN)
+        with btest:
+            do_test = st.form_submit_button("🧪 保存并连接测试", width="stretch", disabled=not IS_ADMIN)
+
+    if do_save or do_test:
+        err = None
+        if api_type == "openai_compatible" and not prov.get("no_key") and not api_key.strip():
+            err = f"{prov.get('name')} 需要填写 API Key 才能调用真实模型。"
+        elif api_type == "azure_openai" and not (azure_endpoint.strip() and api_key.strip() and azure_deployment.strip()):
+            err = "Azure OpenAI 需要 Endpoint / API Key / 部署名都不为空。"
+
+        if err:
+            st.error(f"❌ {err}")
+        else:
+            new_cfg = dict(cfg)
+            new_llm = {
+                "provider": new_provider,
+                "mode": "azure_openai" if api_type == "azure_openai" else ("mock" if api_type == "mock" else new_provider),
+                "model": model_name,
+                "api_key": api_key.strip(),
+                "api_base": (api_base or prov.get("api_base", "")).strip(),
+                "azure_endpoint": azure_endpoint.strip(),
+                "azure_api_key": api_key.strip() if api_type == "azure_openai" else llm_cfg.get("azure_api_key", ""),
+                "azure_deployment": azure_deployment.strip(),
+                "azure_api_version": azure_api_version.strip() or "2024-08-01-preview",
+                "temperature": float(temp),
+                "max_tokens": int(mx),
+            }
+            new_cfg["llm"] = new_llm
+
+            try:
+                save_config(new_cfg)
+                reload_config()
+                llm_client.reset_client()
+            except Exception as e:
+                st.error(f"❌ 保存失败：{type(e).__name__}: {e}")
+                st.stop()
+
+            st.success(f"✅ 已保存。当前模型：**{prov.get('emoji','')} {prov.get('name')}** · `{model_name}`")
+
+            if do_test:
+                with st.spinner(f"正在连接 {prov.get('name')} ..."):
+                    try:
+                        cli = llm_client.get_llm_client()
+                        out = cli.chat_json(
+                            "你是 JSON 测试器，必须返回 JSON。",
+                            '请回复：{"ok": true, "model": "<your-name>", "msg": "hello"}',
+                        )
+                        if "_error" in out:
+                            tip = ""
+                            if prov.get("no_key"):
+                                tip = f"\n\n💡 本地模式排查：\n1. 服务是否启动？\n2. 端口是否匹配 `{prov.get('api_base')}`？\n3. 模型是否已下载（如 `ollama pull {model_name}`）？"
+                            st.error(f"❌ 连接失败：{out.get('_error')}  \n返回：`{out.get('_raw','')[:200]}`{tip}")
+                        else:
+                            st.success(f"✅ 连接成功！模型返回：`{out}`")
+                    except Exception as e:
+                        st.error(f"❌ 连接失败：{type(e).__name__}: {e}")
+            else:
+                st.rerun()
+
+    st.markdown("---")
+
+    # ============ 语言 & 部门 ============
+    st.subheader("🌐 语言 & 部门 DIY")
+    st.caption("可在此添加自定义语言（如其它小语种）和组织部门。内置项受保护，不可删除。")
+    col_lang, col_dept = st.columns(2)
+
+    with col_lang:
+        st.subheader("🌐 语言库")
+        lrows = []
+        for l in lang_cfg["languages"]:
+            lrows.append({
+                "名称": l["name"], "代码": l.get("code", "—"),
+                "类型": "内置" if l.get("builtin") else "自定义",
+            })
+        st.dataframe(pd.DataFrame(lrows), width="stretch", hide_index=True)
+
+        with st.form("add_lang"):
+            st.markdown("**➕ 新增语言**")
+            n = st.text_input("名称 *（如：荷兰语）")
+            c = st.text_input("ISO 代码（如：nl）")
+            if st.form_submit_button("添加", width="stretch", disabled=not IS_ADMIN):
+                if not n.strip():
+                    st.error("请填写名称")
+                elif any(x["name"] == n for x in lang_cfg["languages"]):
+                    st.error("已存在")
+                else:
+                    lang_cfg["languages"].append({"name": n.strip(), "code": c.strip(), "builtin": False})
+                    save_languages(lang_cfg)
+                    st.success(f"已添加：{n}")
+                    st.rerun()
+
+        st.markdown("**🗑️ 删除自定义语言**")
+        custom_langs = [l["name"] for l in lang_cfg["languages"] if not l.get("builtin")]
+        if custom_langs:
+            to_del = st.selectbox("选择", custom_langs, key="del_lang_pick")
+            if st.button("删除该语言", key="del_lang_btn", disabled=not IS_ADMIN):
+                lang_cfg["languages"] = [l for l in lang_cfg["languages"] if l["name"] != to_del]
+                save_languages(lang_cfg)
+                st.warning(f"已删除：{to_del}")
+                st.rerun()
+        else:
+            st.caption("（暂无自定义语言）")
+
+    with col_dept:
+        st.subheader("🏢 组织部门")
+        drows = []
+        for d in dept_cfg["departments"]:
+            drows.append({
+                "名称": d["name"],
+                "类型": "内置" if d.get("builtin") else "自定义",
+            })
+        st.dataframe(pd.DataFrame(drows), width="stretch", hide_index=True)
+
+        with st.form("add_dept"):
+            st.markdown("**➕ 新增部门**")
+            nd = st.text_input("部门名称 *")
+            if st.form_submit_button("添加", width="stretch", disabled=not IS_ADMIN):
+                if not nd.strip():
+                    st.error("请填写名称")
+                elif any(x["name"] == nd for x in dept_cfg["departments"]):
+                    st.error("已存在")
+                else:
+                    dept_cfg["departments"].append({"name": nd.strip(), "builtin": False})
+                    save_departments(dept_cfg)
+                    st.success(f"已添加：{nd}")
+                    st.rerun()
+
+        st.markdown("**🗑️ 删除自定义部门**")
+        custom_depts = [d["name"] for d in dept_cfg["departments"] if not d.get("builtin")]
+        if custom_depts:
+            to_del_d = st.selectbox("选择", custom_depts, key="del_dept_pick")
+            if st.button("删除该部门", key="del_dept_btn", disabled=not IS_ADMIN):
+                dept_cfg["departments"] = [d for d in dept_cfg["departments"] if d["name"] != to_del_d]
+                save_departments(dept_cfg)
+                st.warning(f"已删除：{to_del_d}")
+                st.rerun()
+        else:
+            st.caption("（暂无自定义部门）")
+
+    st.markdown("---")
+    _render_ops_trend_panel()
+    st.markdown("---")
+    _render_governance_panel()
+
+
+# ---------------- 侧边栏 ----------------
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#667eea,#764ba2);
+                    padding:14px 16px;border-radius:12px;color:white;margin-bottom:14px;">
+            <div style="font-size:18px;font-weight:700;">🎯 TalentScope</div>
+            <div style="font-size:11px;opacity:.85;">v1.2 · 多模型 / 本地优先</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### 🚀 当前引擎")
+    st.markdown(
+        f"""
+        <div style="background:#f8fafc;padding:12px;border-radius:10px;
+                    border-left:3px solid #764ba2;font-size:13px;line-height:1.7;">
+            <b>{_prov_name}</b><br>
+            <span style="color:#64748b;">📦 {_model_name}</span><br>
+            <span style="color:#94a3b8;font-size:11px;">{_prov_group}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### ✨ 亮点")
+    st.markdown(
+        """
+        - 🤖 **10+ 模型一键切换**（国产 / 本地 / 国际）
+        - 🏠 **本地优先**：Ollama / LM Studio / vLLM
+        - 🔒 PII 全程脱敏
+        - 📊 5 维加权评分（含语言）
+        - 🗂️ 持久化简历库 + DIY 部门/语种
+        - 📄 一键 Markdown / Excel 报告
+        """
+    )
+
+    st.markdown("### ⚙️ 操作")
+    st.markdown(f"当前登录：**{AUTH_USER.get('display_name', AUTH_USER.get('username', ''))}**（{ROLE_TEXT}）")
+    if st.button("🚪 退出登录", width="stretch"):
+        st.session_state["auth_user"] = None
+        st.rerun()
+
+    if st.button("🔄 重新加载配置", width="stretch", disabled=not IS_ADMIN):
+        llm_client.reset_client()
+        reload_config()
+        st.cache_data.clear()
+        st.success("已重置")
+        st.rerun()
+
+    if st.button("📂 打开输出目录", width="stretch", disabled=not IS_ADMIN):
+        import os
+        out = get_root() / cfg["storage"]["output_dir"]
+        if sys.platform == "win32":
+            os.startfile(out)
+        st.info(f"目录：{out}")
