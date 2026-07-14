@@ -1,0 +1,20 @@
+岗位名称：高级 Python 后端工程师
+
+工作职责：
+1. 负责核心业务系统的架构设计与后端开发
+2. 基于 FastAPI / Django 构建高并发 RESTful 服务
+3. 设计与优化数据库结构（PostgreSQL / Redis）
+4. 参与微服务拆分、容器化部署 (Docker + Kubernetes)
+5. 与前端、产品、测试团队跨部门协作，推动需求落地
+6. 编写技术文档、参与代码评审、培养初级工程师
+
+任职要求：
+- 计算机相关专业本科及以上学历
+- 5 年以上 Python 后端开发经验
+- 精通 FastAPI 或 Django，熟悉异步编程
+- 熟练使用 PostgreSQL、Redis，能进行性能调优
+- 熟悉 Docker、Kubernetes，有云原生部署经验（Azure / AWS 优先）
+- 熟悉 CI/CD 流程（GitHub Actions / GitLab CI）
+- 良好的团队协作和沟通能力
+- 有 LangChain / Azure OpenAI 等 AI/LLM 项目经验者优先
+- 有大型 SaaS 系统或金融行业项目经验者优先

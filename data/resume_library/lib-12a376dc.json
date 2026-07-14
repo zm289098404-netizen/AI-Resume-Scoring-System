@@ -1,0 +1,36 @@
+{
+  "id": "lib-12a376dc",
+  "display_name": "resume_07_吴测试七.pdf",
+  "department": "技术研发部",
+  "source_file": "resume_07_吴测试七.pdf",
+  "imported_at": "2026-05-20T17:06:50",
+  "parsed": {
+    "candidate_id": "R-2415",
+    "skills": [
+      "Python",
+      "Go",
+      "R",
+      "Kubernetes",
+      "Terraform",
+      "Ansible",
+      "Helm",
+      "Prometheus",
+      "Grafana"
+    ],
+    "experience_years": 8,
+    "education": "本科",
+    "highlights": [
+      "有完整项目交付经验",
+      "熟悉云原生与 DevOps 流程"
+    ],
+    "risks": []
+  },
+  "languages": [
+    {
+      "name": "英语",
+      "level": "流利"
+    }
+  ],
+  "tags": [],
+  "notes": ""
+}

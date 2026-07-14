@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Config (含敏感信息)
+config/config.json
+
+# Output
+data/output/
+*.log
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

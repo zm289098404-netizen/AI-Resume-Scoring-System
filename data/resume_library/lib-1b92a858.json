@@ -1,0 +1,42 @@
+{
+  "id": "lib-1b92a858",
+  "display_name": "resume_01_张测试一.pdf",
+  "department": "技术研发部",
+  "source_file": "resume_01_张测试一.pdf",
+  "imported_at": "2026-05-20T17:06:50",
+  "parsed": {
+    "candidate_id": "R-1712",
+    "skills": [
+      "Python",
+      "Go",
+      "R",
+      "Django",
+      "Flask",
+      "FastAPI",
+      "MySQL",
+      "PostgreSQL",
+      "Redis",
+      "ClickHouse",
+      "Docker",
+      "Kubernetes",
+      "Kafka",
+      "GitHub Actions",
+      "沟通能力"
+    ],
+    "experience_years": 8,
+    "education": "本科",
+    "highlights": [
+      "有完整项目交付经验",
+      "熟悉云原生与 DevOps 流程"
+    ],
+    "risks": []
+  },
+  "languages": [
+    {
+      "name": "英语",
+      "level": "流利"
+    }
+  ],
+  "tags": [],
+  "notes": ""
+}

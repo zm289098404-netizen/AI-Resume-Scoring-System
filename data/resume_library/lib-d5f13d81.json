@@ -1,0 +1,33 @@
+{
+  "id": "lib-d5f13d81",
+  "display_name": "resume_08_郑测试八.pdf",
+  "department": "技术研发部",
+  "source_file": "resume_08_郑测试八.pdf",
+  "imported_at": "2026-05-20T17:06:50",
+  "parsed": {
+    "candidate_id": "R-2776",
+    "skills": [
+      "Swift",
+      "R"
+    ],
+    "experience_years": 6,
+    "education": "本科",
+    "highlights": [
+      "有完整项目交付经验",
+      "熟悉云原生与 DevOps 流程"
+    ],
+    "risks": []
+  },
+  "languages": [
+    {
+      "name": "英语",
+      "level": "日常"
+    },
+    {
+      "name": "韩语",
+      "level": "日常"
+    }
+  ],
+  "tags": [],
+  "notes": ""
+}
